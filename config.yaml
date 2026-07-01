@@ -1,0 +1,49 @@
+# Global paths for vul_robustness (edit project_root or override paths for your machine)
+project_root: "{YOUR_PROJECT_PATH}"
+
+paths:
+  language_so: "{project_root}/my-languages.so"
+  vocab_dir: "{project_root}/MHM/data/vocab"
+  joern: "{JOERN_PATH}"
+
+models:
+  reveal_checkpoint: "{MODEL_SAVE_PATH}/trained_model/reveal_cwe119/mod_mix86.58_90.2_88.76.ckpt"
+  ivdetect_checkpoint: "{MODEL_SAVE_PATH}/trained_model/ori-ds/ivdetect/ivdetect-cwe119/mod_95.73_94.67_96.81_95.01.ckpt"
+  # word2vec: "{MODEL_SAVE_PATH}/trained_model/w2v_model/ori_universal_w2v.wv"
+  word2vec: "{MODEL_SAVE_PATH}/trained_model/w2v_model/normal_universal_w2v.wv"
+  local_codebert: "{HOME_PATH}/HuggingFace/model/codebert/"
+  local_codet5: "{HOME_PATH}/HuggingFace/model/codet5-base/"
+
+# data/raw artifacts (paths only; do not commit large binaries)
+datasets:
+  dip_code_db: "{project_root}/DIP/data/raw/code_db.pt"
+  dip_src_paths: "{project_root}/DIP/data/raw/src_paths.json"
+  coda_db_dir: "{HOME_PATH}/vul_robustness/CODA/data/raw"
+  coda_code_db: "{project_root}/CODA/data/raw/ivdetect_cwe119_cls.pt"
+  coda_src_paths: "{project_root}/CODA/data/raw/ivdetect_cwe119_src_paths.json"
+  training_set_src: "{HOME_PATH}/VulDS/Reveal/normal-src"
+  # Use {db_name} placeholder for TRAINING_SET_LIST_PATH-style composition
+  training_set_list_template: "{HOME_PATH}/VulDS/Reveal/normal-embedding/{db_name}_train.txt"
+
+language:
+  default: "cpp"
+
+vocab:
+  max_size_default: 10000
+  max_size_mhm: 500000
+  min_freq_mhm: 3
+
+attack:
+  mhm_max_iter: 20
+  mask_placeholder: "MASK_PLACEHOLDER"
+  mask: "<MASK>"
+  pop_size: 10
+  max_gen: 5
+  moaa_max_gen: 5
+  mutation_rate: 0.2
+
+device:
+  default: "cuda:0"
+
+training:
+  batch_size_mhm: 16
