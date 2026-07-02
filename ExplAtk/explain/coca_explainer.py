@@ -1,19 +1,19 @@
 """
-Coca Explainer: 双视角因果推理解释器
+Coca Explainer: dual-view causal-reasoning explainer
 ================================================
-基于 Coca (ICSE'24) 论文 Section 5.2 实现。
+Implemented based on Section 5.2 of the Coca (ICSE'24) paper.
 
-核心思想：
-  通过同时优化事实推理（factual reasoning）和反事实推理（counterfactual reasoning），
-  生成既有效（覆盖真正的漏洞语句）又简洁（范围尽可能小）的解释子图。
+Core idea:
+  By jointly optimizing factual reasoning and counterfactual reasoning,
+  generate an explanation subgraph that is both effective (covers true vulnerable statements) and concise (keeps the scope as small as possible).
 
-  - 事实推理：保留的子图应维持原始预测 → 保证有效性
-  - 反事实推理：移除的子图应改变预测 → 保证简洁性
+  - Factual reasoning: the retained subgraph should preserve the original prediction → ensures effectiveness
+  - Counterfactual reasoning: removing the subgraph should change the prediction → ensures conciseness
 
-适配说明：
-  - 适配 model(x, edge_index) 签名的 GNN 模型
-  - 节点特征掩码完全可微，边掩码使用可微近似
-  - 输出节点级重要性分数，可直接映射到源码语句
+Adaptation notes:
+  - Supports GNN models with the model(x, edge_index) signature
+  - Node-feature masks are fully differentiable; edge masks use a differentiable approximation
+  - Outputs node-level importance scores that can be directly mapped to source-code statements
 """
 
 import torch
@@ -29,21 +29,21 @@ from common.utils.gen_embedding import (
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 核心类：Coca Explainer
+# Core class: Coca Explainer
 # ══════════════════════════════════════════════════════════════════════
 
 class CocaExplainer:
     """
-    Coca 双视角因果推理解释器。
+    Coca dual-view causal-reasoning explainer.
 
-    对一个被检测为 vulnerable 的样本，通过优化可学习掩码，
-    找到对模型预测最关键的节点（语句）和边（依赖关系）。
+    For a sample detected as vulnerable, optimize learnable masks
+    to find the nodes (statements) and edges (dependencies) most critical to the model prediction.
 
-    用法:
+    Usage:
         explainer = CocaExplainer(model, device='cuda')
         result = explainer.explain(data, predicted_label=1)
-        print(result['node_importance'])   # 每个节点的重要性分数
-        print(result['top_nodes'])         # top-k 关键节点索引
+        print(result['node_importance'])   # Importance score for each node
+        print(result['top_nodes'])         # Top-k key node indices
     """
 
     def __init__(
@@ -59,15 +59,15 @@ class CocaExplainer:
     ):
         """
         Args:
-            model:              GNN 模型实例（已加载权重），forward 签名为 model(x, edge_index)
-            device:             计算设备
-            alpha:              事实/反事实推理的权衡系数，值越大越侧重有效性
-                                α=0.5 表示均衡（论文默认），α>0.5 侧重有效性，α<0.5 侧重简洁性
-            lr:                 掩码优化的学习率
-            epochs:             优化迭代轮数
-            sparsity_coeff_feat: 节点特征掩码的稀疏正则系数
-            sparsity_coeff_edge: 边掩码的稀疏正则系数
-            top_k:              返回 top-k 个最重要的节点
+            model:              GNN model instance (weights loaded), with forward signature model(x, edge_index)
+            device:             compute device
+            alpha:              trade-off coefficient between factual and counterfactual reasoning; larger values emphasize effectiveness
+                                alpha=0.5 means balanced (paper default); alpha>0.5 emphasizes effectiveness, alpha<0.5 emphasizes conciseness
+            lr:                 learning rate for mask optimization
+            epochs:             number of optimization iterations
+            sparsity_coeff_feat: sparsity regularization coefficient for the node-feature mask
+            sparsity_coeff_edge: sparsity regularization coefficient for the edge mask
+            top_k:              return the top-k most important nodes
         """
         self.model = model
         self.device = device
@@ -78,33 +78,33 @@ class CocaExplainer:
         self.sparsity_coeff_edge = sparsity_coeff_edge
         self.top_k = top_k
 
-        # 冻结模型参数（只优化掩码，不更新模型）
+        # Freeze model parameters (optimize only masks; do not update the model)
         self.model.to(self.device)
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
 
     # ─────────────────────────────────────────────────────────
-    # 主入口
+    # Main entry point
     # ─────────────────────────────────────────────────────────
 
     def explain(self, data, predicted_label):
         """
-        对单个样本生成解释。
+        Generate an explanation for a single sample.
 
         Args:
-            data:             PyG Data 对象 (x, edge_index, edge_attr, y)
-            predicted_label:  模型对该样本的预测标签（通常为 1=vulnerable）
+            data:             PyG Data object (x, edge_index, edge_attr, y)
+            predicted_label:  model-predicted label for this sample (usually 1 = vulnerable)
 
         Returns:
             dict: {
-                'node_importance':  np.ndarray (num_nodes,) 每个节点的重要性分数（0~1）,
-                'edge_importance':  np.ndarray (num_edges,) 每条边的重要性分数（0~1）,
-                'top_nodes':        list[int]  top-k 关键节点索引,
-                'top_edges':        list[int]  top-k 关键边索引,
-                'feat_mask_raw':    np.ndarray sigmoid 前的原始掩码值,
-                'edge_mask_raw':    np.ndarray sigmoid 前的原始掩码值,
-                'loss_history':     list[float] 训练损失曲线,
+                'node_importance':  np.ndarray (num_nodes,) importance score for each node (0~1),
+                'edge_importance':  np.ndarray (num_edges,) importance score for each edge (0~1),
+                'top_nodes':        list[int]  top-k key node indices,
+                'top_edges':        list[int]  top-k key edge indices,
+                'feat_mask_raw':    np.ndarray raw mask values before sigmoid,
+                'edge_mask_raw':    np.ndarray raw mask values before sigmoid,
+                'loss_history':     list[float] training loss curve,
             }
         """
         x = data.x.to(self.device)
@@ -116,10 +116,10 @@ class CocaExplainer:
             return self._empty_result(num_nodes, 0)
 
         y_hat = predicted_label
-        y_hat_s = 1 - y_hat  # 二分类：另一个标签
+        y_hat_s = 1 - y_hat  # Binary classification: the other label
 
-        # 初始化为正值，sigmoid 后 ≈ 0.95，表示"默认全部保留"
-        # 加小噪声打破对称性
+        # Initialize to positive values; after sigmoid this is approximately 0.95, meaning "keep everything by default"
+        # Add small noise to break symmetry
         feat_mask = (3.0 * torch.ones(num_nodes, device=self.device)
                     + 0.1 * torch.randn(num_nodes, device=self.device))
         feat_mask.requires_grad = True
@@ -130,7 +130,7 @@ class CocaExplainer:
 
         optimizer = torch.optim.Adam([feat_mask, edge_mask], lr=self.lr)
 
-        # ── 优化循环 ────────────────────────────────────
+        # ── Optimization loop ────────────────────────────────────
         loss_history = []
         best_loss = float('inf')
         best_feat_mask = None
@@ -143,36 +143,36 @@ class CocaExplainer:
                 sigmoid_feat = torch.sigmoid(feat_mask)
                 sigmoid_edge = torch.sigmoid(edge_mask)
 
-                # ── 事实推理 (Factual Reasoning) ──
-                # 保留的子图应维持原始预测
+                # ── Factual reasoning ──
+                # The retained subgraph should preserve the original prediction
                 probs_fact = self._masked_forward(
                     x, edge_index, sigmoid_feat, sigmoid_edge, mode='factual'
                 )
                 S_f = probs_fact[0, y_hat]
 
-                # ── 反事实推理 (Counterfactual Reasoning) ──
-                # 移除子图后应改变预测
+                # ── Counterfactual reasoning ──
+                # Removing the subgraph should change the prediction
                 probs_cf = self._masked_forward(
                     x, edge_index, sigmoid_feat, sigmoid_edge, mode='counterfactual'
                 )
                 S_c_neg = -probs_cf[0, y_hat]
 
-                # ── 对比损失 (Eq. 7) ──
+                # ── Contrastive loss (Eq. 7) ──
                 L_f = F.relu(0.5 - S_f + probs_fact[0, y_hat_s])
                 L_c = F.relu(0.5 - S_c_neg - probs_cf[0, y_hat_s])
 
-                # ── 稀疏性正则 ──
+                # ── Sparsity regularization ──
                 sparsity_loss = (
                     self.sparsity_coeff_feat * sigmoid_feat.sum()
                     + self.sparsity_coeff_edge * sigmoid_edge.sum()
                 )
 
-                # ── 连续性正则（鼓励相邻节点有相似的掩码值）──
+                # ── Continuity regularization (encourages adjacent nodes to have similar mask values) ──
                 continuity_loss = self._continuity_regularization(
                     sigmoid_feat, edge_index
                 )
 
-                # ── 总损失 (Eq. 8) ──
+                # ── Total loss (Eq. 8) ──
                 loss = (
                     sparsity_loss
                     + self.alpha * L_f
@@ -191,15 +191,15 @@ class CocaExplainer:
                     best_feat_mask = feat_mask.detach().clone()
                     best_edge_mask = edge_mask.detach().clone()
 
-        # ── 后处理：生成最终结果 ──────────────────────
+        # ── Post-processing: generate final results ──────────────────────
         node_importance = torch.sigmoid(best_feat_mask).cpu().numpy()
         edge_importance = torch.sigmoid(best_edge_mask).cpu().numpy()
 
-        # top-k 节点
+        # Top-k nodes
         k = min(self.top_k, num_nodes)
         top_nodes = np.argsort(node_importance)[::-1][:k].tolist()
 
-        # top-k 边
+        # Top-k edges
         k_edge = min(self.top_k, num_edges)
         top_edges = np.argsort(edge_importance)[::-1][:k_edge].tolist()
 
@@ -214,47 +214,47 @@ class CocaExplainer:
         }
 
     # ─────────────────────────────────────────────────────────
-    # 掩码前向传播
+    # Masked forward pass
     # ─────────────────────────────────────────────────────────
 
     def _masked_forward(self, x, edge_index, sigmoid_feat, sigmoid_edge, mode):
         """
-        带掩码的可微前向传播。
+        Differentiable forward pass with masks.
 
-        对于节点掩码：直接乘以节点特征（完全可微）。
-        对于边掩码：通过缩放源节点在每条边上的贡献来近似实现（可微近似）。
+        For the node mask: multiply it directly with node features (fully differentiable).
+        For the edge mask: approximate it by scaling the source-node contribution on each edge (differentiable approximation).
 
         Args:
-            x:            (num_nodes, feat_dim) 原始节点特征
-            edge_index:   (2, num_edges) 边索引
-            sigmoid_feat: (num_nodes,) sigmoid 后的节点掩码值
-            sigmoid_edge: (num_edges,) sigmoid 后的边掩码值
-            mode:         'factual' 或 'counterfactual'
+            x:            (num_nodes, feat_dim) original node features
+            edge_index:   (2, num_edges) edge indices
+            sigmoid_feat: (num_nodes,) node-mask values after sigmoid
+            sigmoid_edge: (num_edges,) edge-mask values after sigmoid
+            mode:         'factual' or 'counterfactual'
 
         Returns:
-            probs: (1, num_classes) softmax 概率
+            probs: (1, num_classes) softmax probabilities
         """
         if mode == 'factual':
-            # 事实推理：保留掩码选中的部分
+            # Factual reasoning: keep the parts selected by the mask
             node_weight = sigmoid_feat
             edge_weight = sigmoid_edge
         else:
-            # 反事实推理：移除掩码选中的部分
+            # Counterfactual reasoning: remove the parts selected by the mask
             node_weight = 1.0 - sigmoid_feat
             edge_weight = 1.0 - sigmoid_edge
 
-        # ── 节点特征掩码（完全可微）──
+        # ── Node-feature mask (fully differentiable) ──
         x_masked = x * node_weight.unsqueeze(-1)
 
-        # ── 边掩码（可微近似）──
-        # 策略：将边权重聚合到节点上，作为额外的缩放因子
-        # 原理：如果一个节点的所有入边权重都很低，
-        #       说明该节点接收的信息不重要，应进一步抑制
+        # ── Edge mask (differentiable approximation) ──
+        # Strategy: aggregate edge weights onto nodes as an additional scaling factor
+        # Rationale: if all incoming-edge weights of a node are low,
+        #       the information received by that node is not important and should be further suppressed
         x_masked = self._apply_edge_mask_to_features(
             x_masked, edge_index, edge_weight
         )
 
-        # ── 模型前向传播（不加 no_grad，保持可微）──
+        # ── Model forward pass (without no_grad, to keep it differentiable) ──
         logits = self.model(x_masked, edge_index)
         probs = torch.softmax(logits, dim=-1)
 
@@ -262,68 +262,68 @@ class CocaExplainer:
 
     def _apply_edge_mask_to_features(self, x, edge_index, edge_weight):
         """
-        将边掩码的信息融入节点特征。
+        Incorporate edge-mask information into node features.
 
-        由于模型 forward 签名为 model(x, edge_index) 不支持 edge_weight，
-        我们通过修改节点特征来近似边掩码的效果：
+        Because the model forward signature model(x, edge_index) does not support edge_weight,
+        we approximate the effect of edge masks by modifying node features:
 
-        对每个节点 d，计算其入边权重的加权平均值 w_d，
-        然后将节点特征缩放为 x[d] * w_d。
+        For each node d, compute the weighted average w_d of its incoming-edge weights,
+        then scale the node features to x[d] * w_d.
 
-        这近似了"如果指向 d 的边被移除，d 接收到的信息就减少"的效果。
+        This approximates the effect that "if edges pointing to d are removed, the information received by d is reduced".
 
         Args:
-            x:           (num_nodes, feat_dim) 已经过节点掩码的特征
+            x:           (num_nodes, feat_dim) features after applying the node mask
             edge_index:  (2, num_edges)
-            edge_weight: (num_edges,) 边权重
+            edge_weight: (num_edges,) edge weights
 
         Returns:
-            x_scaled: (num_nodes, feat_dim) 缩放后的特征
+            x_scaled: (num_nodes, feat_dim) scaled features
         """
         num_nodes = x.shape[0]
         src, dst = edge_index
 
-        # 计算每个节点的入边权重之和
+        # Compute the sum of incoming-edge weights for each node
         weighted_degree = torch.zeros(num_nodes, device=x.device)
         weighted_degree.scatter_add_(0, dst, edge_weight)
 
-        # 计算每个节点的入边数量
+        # Compute the number of incoming edges for each node
         degree = torch.zeros(num_nodes, device=x.device)
         degree.scatter_add_(0, dst, torch.ones_like(edge_weight))
 
-        # 加权平均（避免除零）
+        # Weighted average (avoid division by zero)
         degree = degree.clamp(min=1.0)
         node_scale = weighted_degree / degree  # (num_nodes,)
 
-        # 对没有入边的节点（如入口节点），保持原始特征
+        # For nodes with no incoming edges (such as entry nodes), keep the original features
         no_incoming = (degree <= 1.0) & (weighted_degree == 0)
         node_scale[no_incoming] = 1.0
 
-        # 缩放节点特征
+        # Scale node features
         x_scaled = x * node_scale.unsqueeze(-1)
 
         return x_scaled
 
     # ─────────────────────────────────────────────────────────
-    # 正则化
+    # Regularization
     # ─────────────────────────────────────────────────────────
 
     def _continuity_regularization(self, sigmoid_feat, edge_index):
         """
-        连续性正则：鼓励图中相邻节点的掩码值接近。
-        如果节点 s 重要，那么与 s 有依赖关系的节点 d 也倾向于重要。
-        这有助于生成连贯的解释子图，而不是孤立的节点。
+        Continuity regularization: encourage adjacent nodes in the graph to have similar mask values.
+        If node s is important, then node d that depends on s also tends to be important.
+        This helps generate a coherent explanation subgraph rather than isolated nodes.
         """
         src, dst = edge_index
         diff = (sigmoid_feat[src] - sigmoid_feat[dst]) ** 2
         return diff.mean()
 
     # ─────────────────────────────────────────────────────────
-    # 辅助方法
+    # Helper methods
     # ─────────────────────────────────────────────────────────
 
     def _empty_result(self, num_nodes, num_edges):
-        """当图为空或无边时的默认返回"""
+        """Default return value when the graph is empty or has no edges"""
         return {
             'node_importance': np.zeros(num_nodes),
             'edge_importance': np.zeros(num_edges),
@@ -336,14 +336,14 @@ class CocaExplainer:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 批量解释器：对数据集中所有正确检测的样本批量生成解释
+# Batch explainer: generate explanations for all correctly detected samples in the dataset
 # ══════════════════════════════════════════════════════════════════════
 
 class BatchCocaExplainer:
     """
-    批量运行 Coca Explainer，对数据集中所有被正确检测为 vulnerable 的样本生成解释。
+    Run Coca Explainer in batch mode and generate explanations for all samples correctly detected as vulnerable in the dataset.
 
-    用法:
+    Usage:
         batch_explainer = BatchCocaExplainer(model, device='cuda')
         all_results = batch_explainer.explain_dataset(dataset, model_wrapper)
     """
@@ -354,15 +354,15 @@ class BatchCocaExplainer:
 
     def explain_dataset(self, dataset, model_wrapper, only_vulnerable=True):
         """
-        对数据集中的样本批量生成解释。
+        Generate explanations for samples in a dataset in batch mode.
 
         Args:
-            dataset:          list[Data] PyG Data 对象列表
-            model_wrapper:    ModelWrapper 实例（用于获取预测标签）
-            only_vulnerable:  是否只解释被预测为 vulnerable 的样本
+            dataset:          list[Data] list of PyG Data objects
+            model_wrapper:    ModelWrapper instance (used to get predicted labels)
+            only_vulnerable:  whether to explain only samples predicted as vulnerable
 
         Returns:
-            list[dict]: 每个样本的解释结果，包含原始索引
+            list[dict]: explanation result for each sample, including the original index
         """
         results = []
 
@@ -370,7 +370,7 @@ class BatchCocaExplainer:
             pred_label = model_wrapper.predict_label(data)
             true_label = data.y.item() if hasattr(data, 'y') else None
 
-            # 只解释模型预测正确且预测为 vulnerable 的样本
+            # Explain only samples that the model predicts correctly and as vulnerable
             if only_vulnerable and pred_label != 1:
                 continue
             if true_label is not None and pred_label != true_label:
@@ -384,49 +384,49 @@ class BatchCocaExplainer:
                 results.append(result)
 
                 if (len(results)) % 50 == 0:
-                    print(f"[Coca_Exp] 已解释 {len(results)} 个样本...")
+                    print(f"[Coca_Exp] Explained {len(results)} samples...")
 
             except Exception as e:
-                print(f"[Coca_Exp] 样本 {idx} 解释失败: {e}")
+                print(f"[Coca_Exp] Failed to explain sample {idx}: {e}")
                 continue
 
-        print(f"[Coca_Exp] 完成，共解释 {len(results)} 个样本。")
+        print(f"[Coca_Exp] Done. Explained {len(results)} samples in total.")
         return results
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 解释结果分析工具
+# Explanation-result analysis utilities
 # ══════════════════════════════════════════════════════════════════════
 
 class ExplanationAnalyzer:
-    """分析和可视化解释结果的工具类。"""
+    """Utility class for analyzing and visualizing explanation results."""
 
     @staticmethod
     def get_explanation_subgraph(data, result, threshold=0.5):
         """
-        从解释结果中提取解释子图。
+        Extract an explanation subgraph from an explanation result.
 
         Args:
-            data:      原始 PyG Data 对象
-            result:    CocaExplainer.explain() 的返回值
-            threshold: 节点/边掩码的阈值
+            data:      original PyG Data object
+            result:    return value of CocaExplainer.explain()
+            threshold: threshold for node/edge masks
 
         Returns:
-            Data: 解释子图的 PyG Data 对象
+            Data: PyG Data object for the explanation subgraph
         """
         node_mask = result['node_importance'] > threshold
         edge_mask = result['edge_importance'] > threshold
 
-        # 保留的节点
+        # Retained nodes
         kept_nodes = np.where(node_mask)[0]
         if len(kept_nodes) == 0:
-            # 阈值太高，回退到 top-k
+            # Threshold is too high; fall back to top-k
             kept_nodes = np.array(result['top_nodes'])
 
-        # 创建节点映射（旧索引 → 新索引）
+        # Create node mapping (old index → new index)
         node_mapping = {old: new for new, old in enumerate(kept_nodes)}
 
-        # 过滤边：只保留两端节点都在 kept_nodes 中的边
+        # Filter edges: keep only edges whose endpoints are both in kept_nodes
         edge_index = data.edge_index.numpy()
         kept_edges = []
         for i in range(edge_index.shape[1]):
@@ -435,7 +435,7 @@ class ExplanationAnalyzer:
                 if edge_mask[i]:
                     kept_edges.append([node_mapping[src], node_mapping[dst]])
 
-        # 构建子图
+        # Build the subgraph
         x_sub = data.x[kept_nodes]
         if kept_edges:
             edge_index_sub = torch.tensor(kept_edges, dtype=torch.long).t()
@@ -449,11 +449,11 @@ class ExplanationAnalyzer:
     @staticmethod
     def evaluate_explanation(result, ground_truth_nodes):
         """
-        评估解释质量（VTP 指标）。
+        Evaluate explanation quality (VTP metrics).
 
         Args:
-            result:              CocaExplainer.explain() 的返回值
-            ground_truth_nodes:  list[int] 真实漏洞相关节点索引
+            result:              return value of CocaExplainer.explain()
+            ground_truth_nodes:  list[int] ground-truth vulnerability-related node indices
 
         Returns:
             dict: {MSP, MSR, MIoU}
@@ -476,16 +476,16 @@ class ExplanationAnalyzer:
     @staticmethod
     def print_explanation(result, node_meta=None):
         """
-        打印解释结果。
+        Print the explanation result.
 
         Args:
-            result:    explain() 的返回值
-            node_meta: 可选，节点元数据列表（含行号和代码）
+            result:    return value of explain()
+            node_meta: optional node metadata list (including line numbers and code)
         """
         print("=" * 60)
         print("Coca Explanation Result")
         print("=" * 60)
-        print(f"Top-{len(result['top_nodes'])} 关键节点:")
+        print(f"Top-{len(result['top_nodes'])} key nodes:")
         for rank, node_idx in enumerate(result['top_nodes']):
             score = result['node_importance'][node_idx]
             if node_meta and node_idx < len(node_meta):
@@ -500,25 +500,25 @@ class ExplanationAnalyzer:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 使用示例
+# Usage example
 # ══════════════════════════════════════════════════════════════════════
 
 def demo_explain_coca():
-    # 1. 加载模型（你现有的流程）
+    # 1. Load the model (your existing workflow)
     wrapper = ModelWrapper('reveal', '{HOME_PATH}/vul_explain/23_explain_eval_ISSTA/trained_model/ori-ds/reveal/reveal-cwe119/mod_94.59_92.5_96.77_93.61.ckpt')
 
-    # 2. 创建解释器
+    # 2. Create the explainer
     explainer = CocaExplainer(
-        model=wrapper.model,        # 直接传入模型实例
+        model=wrapper.model,        # Pass the model instance directly
         device='cuda',
-        alpha=0.5,                  # 均衡有效性和简洁性
+        alpha=0.5,                  # Balance effectiveness and conciseness
         lr=0.01,
         epochs=300,
         top_k=5,
     )
 
-    # 3. 对单个样本生成解释
-    data = read_json('{HOME_PATH}/VulDS/BigVul/ori-embedding/vul/1_CVE-2013-1788_poppler_CWE-119_bbc2d8918fe234b7ef2c480eb148943922cc0959_1.json')               # 一个被检测为 vulnerable 的样本
+    # 3. Generate an explanation for a single sample
+    data = read_json('{HOME_PATH}/VulDS/BigVul/ori-embedding/vul/1_CVE-2013-1788_poppler_CWE-119_bbc2d8918fe234b7ef2c480eb148943922cc0959_1.json')               # A sample detected as vulnerable
     ori_code = """
 static int default_filter_frame (AVFilterLink *inlink, AVFrame *wipe_side_data) {
     AVFilterContext *ctx = inlink->dst;
@@ -563,24 +563,24 @@ static int default_filter_frame (AVFilterLink *inlink, AVFrame *wipe_side_data) 
 }
 """
     ori_data = src2embedding(src=ori_code,label=1)
-    pred_label = wrapper.predict_label(data)  # 通常为 1
-    # print(f"原始子图: {data.x.shape[0]} 节点, "
-    #       f"{data.edge_index.shape[1]} 边")
-    print(f"原始样本预测标签: {pred_label}")
+    pred_label = wrapper.predict_label(data)  # Usually 1
+    # print(f"Original subgraph: {data.x.shape[0]} nodes, "
+    #       f"{data.edge_index.shape[1]} edges")
+    print(f"Original sample predicted label: {pred_label}")
 
     # result = explainer.explain(data, pred_label)
 
-    # # 4. 查看结果
-    # print("每个节点 0~1 的重要性: " + str(result['node_importance']))
-    # print("top-k 关键节点: " + str(result['top_nodes']))
+    # # 4. Inspect results
+    # print("Importance of each node from 0 to 1: " + str(result['node_importance']))
+    # print("top-k key nodes: " + str(result['top_nodes']))
 
-    # # 5. 提取解释子图
+    # # 5. Extract the explanation subgraph
     # sub_data = ExplanationAnalyzer.get_explanation_subgraph(data, result)
-    # print(f"解释子图: {sub_data.x.shape[0]} 节点, "
-    #       f"{sub_data.edge_index.shape[1]} 边")
+    # print(f"Explanation subgraph: {sub_data.x.shape[0]} nodes, "
+    #       f"{sub_data.edge_index.shape[1]} edges")
 
     # sub_pred_label = wrapper.predict_label(sub_data)
-    # print(f"解释子图预测标签: {sub_pred_label}")
+    # print(f"Explanation subgraph predicted label: {sub_pred_label}")
 
 
 # test_file

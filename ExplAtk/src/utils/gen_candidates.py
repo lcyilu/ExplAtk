@@ -10,29 +10,29 @@ from transformers import RobertaForMaskedLM, RobertaTokenizer, T5ForConditionalG
 
 
 # ════════════════════════════════════════════════════════════════
-# 线程安全的进程单例缓存
+# Thread-safe process-level singleton cache
 # ════════════════════════════════════════════════════════════════
 
-# CodeBert 模型按 (path, device) 缓存,所有线程共享同一份 GPU 权重
+# Cache the CodeBERT model by (path, device); all threads share the same GPU weights
 _MLM_MODEL_CACHE = {}
 _MLM_MODEL_LOCK = threading.Lock()
 
-# CodeBertTokenizerAligned 用线程本地缓存:
-# - 避免每次调用 gen_candis_* 都重新加载 tokenizer + 重建 tree-sitter parser
-# - 用 thread-local 是为了规避 RobertaTokenizer / tree-sitter 在多线程下的潜在状态问题
-#   每个线程一份,4 线程就 4 个 aligner(每个几十 MB CPU 内存,不上 GPU,可忽略)
+# Use thread-local caching for CodeBertTokenizerAligned:
+# - Avoid reloading the tokenizer and rebuilding the tree-sitter parser on every gen_candis_* call
+# - Use thread-local storage to avoid potential RobertaTokenizer / tree-sitter state issues in multithreading
+#   One aligner per thread; four threads mean four aligners (tens of MB of CPU memory each, no GPU usage, negligible)
 _aligner_local = threading.local()
 
 class CodeBertTokenizerAligned:
     def __init__(self, model_name=LOCAL_CODEBERT_PATH, lang='cpp'):
-        print(f"正在加载 Tokenizer: {model_name} ...")
+        print(f"Loading tokenizer: {model_name} ...")
         self.tokenizer = RobertaTokenizer.from_pretrained(model_name)
         
-        # 加载 C++ 解析器
+        # Load the C++ parser
         self.parser = initialize_language_parser(lang)
 
     def get_all_leaf_nodes(self, node):
-        """递归获取所有叶子节点"""
+        """Recursively collect all leaf nodes."""
         # Blocklist for node types to skip entirely (comments, strings)
         if node.type in ['comment', 'string_literal', 'char_literal', 'preproc_include']:
             return []
@@ -46,79 +46,79 @@ class CodeBertTokenizerAligned:
 
     def tokenize_with_alignment(self, src):
         """
-        核心函数：
-        输入: 源代码字符串
-        输出: 
-          1. model_tokens: 用于输入 CodeBERT 的 token list (例如 ['<s>', 'int', 'Ġs', 'ush', 'u', ...])
-          2. alignment_map: 一个列表，长度与 model_tokens 相同。
+        Core function:
+        Input: source-code string
+        Output: 
+          1. model_tokens: token list used as CodeBERT input (for example ['<s>', 'int', 'Ġs', 'ush', 'u', ...])
+          2. alignment_map: a list with the same length as model_tokens.
              map[i] = {
-                'source_text': 'sushu',   # 这个 token 属于源码里的哪个词
-                'node_type': 'identifier',# 源码里的语法类型
-                'is_target': True/False   # 是否是潜在的攻击目标(变量名)
+                'source_text': 'sushu',   # which source-code word this token belongs to
+                'node_type': 'identifier',# syntax type in the source code
+                'is_target': True/False   # whether this is a potential attack target (variable name)
              }
         """
-        # 1. 确保是 bytes，用于 tree-sitter 精确切片
+        # 1. Ensure the input is bytes for precise tree-sitter slicing
         if isinstance(src, str):
             src = src.encode('utf-8')
         tree = self.parser.parse(src)
         root_node = tree.root_node
         
-        # 2. 获取所有叶子节点 (Lexical Tokens)
+        # 2. Get all leaf nodes (lexical tokens)
         leaf_nodes = self.get_all_leaf_nodes(root_node)
         
-        # 3. 初始化结果容器
+        # 3. Initialize result containers
         full_tokens = [self.tokenizer.cls_token] # [<s>]
-        alignment_map = [None] # <s> 没有对应的源码
+        alignment_map = [None] # <s> has no corresponding source code
         
         last_end_byte = 0
         
         for node in leaf_nodes:
-            # --- A. 获取节点文本 ---
+            # --- A. Get node text ---
             node_text = src[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
             
-            # --- B. 处理节点前的空白 (关键!) ---
-            # CodeBERT (RoBERTa) 依赖 'Ġ' (space) 来区分单词边界。
-            # 我们检查当前节点和上一个节点之间是否有 gap
+            # --- B. Handle whitespace before the node (important!) ---
+            # CodeBERT (RoBERTa) relies on 'Ġ' (space) to distinguish word boundaries.
+            # Check whether there is a gap between the current node and the previous node
             has_space_prefix = False
             if node.start_byte > last_end_byte:
                 gap = src[last_end_byte:node.start_byte].decode('utf-8', errors='ignore')
                 if len(gap) > 0 and gap.isspace():
                     has_space_prefix = True
             
-            # 构造分词输入：如果前面有空格，RoBERTa 需要在词前加空格
-            # 注意：RoBERTa tokenizer 的行为是，如果输入字符串以空格开头，它会把第一个 token 标记为 'Ġ...'
-            # 为了模拟句子的连续性，我们手动控制
+            # Build tokenizer input: if there is preceding whitespace, RoBERTa needs a leading space before the word
+            # Note: if the input string starts with a space, the RoBERTa tokenizer marks the first token as 'Ġ...'
+            # Control this manually to simulate sentence continuity
             input_text = node_text
             if has_space_prefix:
                 input_text = " " + node_text 
             
-            # --- C. 调用 Tokenizer ---
-            # add_special_tokens=False: 我们自己控制 <s> </s>
+            # --- C. Call the tokenizer ---
+            # add_special_tokens=False: we manually control <s> and </s>
             sub_tokens = self.tokenizer.tokenize(input_text)
             
-            # 修正：如果这是文件的第一个词，即使源码没空格，通常也不加 Ġ (视具体 tokenizer 实现而定，RoBERTa 比较 tricky)
-            # 但最简单的方法是直接信赖 tokenizer 对 " text" 的处理。
+            # Note: if this is the first word in the file, Ġ is usually not added even if there is no leading whitespace (tokenizer-dependent; RoBERTa is tricky)
+            # The simplest approach is to trust the tokenizer's handling of " text".
             
-            # --- D. 记录映射关系 ---
-            # 判定这是否是一个攻击目标 (Identifier)
-            # 简单逻辑：类型是 identifier 且符合变量命名规范
+            # --- D. Record the alignment mapping ---
+            # Determine whether this is an attack target (identifier)
+            # Simple logic: the type is identifier and the text follows variable naming rules
             is_target = (node.type == 'identifier' or node.type == 'field_identifier') and \
                         re.match(r'^[a-zA-Z_]\w*$', node_text) is not None
             
-            # 将生成的每一个 sub-token 都指向当前的 source node
+            # Map every generated sub-token to the current source node
             for sub_token in sub_tokens:
                 full_tokens.append(sub_token)
                 alignment_map.append({
                     'source_text': node_text,
                     'node_type': node.type,
                     'is_target': is_target,
-                    'start_byte': node.start_byte, # 方便后续替换源码
+                    'start_byte': node.start_byte, # useful for later source-code replacement
                     'end_byte': node.end_byte
                 })
             
             last_end_byte = node.end_byte
 
-        # 4. 结尾处理
+        # 4. End-of-sequence handling
         full_tokens.append(self.tokenizer.sep_token) # [</s>]
         alignment_map.append(None)
         
@@ -126,11 +126,11 @@ class CodeBertTokenizerAligned:
     
 def generate_candidates_for_variable(model, tokenizer, tokens, align_map, target_var_name, top_k=30):
     """
-    针对指定的变量名 (target_var_name)，生成替换候选词。
-    策略：将该变量的所有 token 替换为 *单个* <mask>。
+    Generate replacement candidates for the specified variable name (target_var_name).
+    Strategy: replace all tokens of this variable with a *single* <mask>.
     """
-    # 1. 找到所有属于 target_var_name 的索引区间
-    # 结构: [ [2, 3, 4], [10, 11, 12] ]
+    # 1. Find all index spans belonging to target_var_name
+    # Structure: [ [2, 3, 4], [10, 11, 12] ]
     occurrences = [] 
     current_span = []
     
@@ -141,23 +141,23 @@ def generate_candidates_for_variable(model, tokenizer, tokens, align_map, target
             if current_span:
                 occurrences.append(current_span)
                 current_span = []
-    # 处理结尾
+    # Handle the trailing span
     if current_span: occurrences.append(current_span)
     
     if not occurrences:
         return []
 
-    # 2. 构建 Masked Token IDs
-    # 我们需要构建一个新的 token list，把 span 替换为单 mask
+    # 2. Build masked token IDs
+    # Build a new token list by replacing each span with a single mask
     masked_token_ids = []
-    token_ids_raw = tokenizer.convert_tokens_to_ids(tokens) # 将 string token 转为 int ID
+    token_ids_raw = tokenizer.convert_tokens_to_ids(tokens) # convert string tokens to int IDs
     mask_token_id = tokenizer.mask_token_id
     
     i = 0
-    mask_indices_in_new_list = [] # 记录新列表中 mask 的位置，方便取预测结果
+    mask_indices_in_new_list = [] # record mask positions in the new list for retrieving predictions
     
     while i < len(token_ids_raw):
-        # 检查当前 i 是否在某个 span 的开头
+        # Check whether the current index is the start of a span
         is_start_of_span = False
         span_len = 0
         
@@ -168,40 +168,40 @@ def generate_candidates_for_variable(model, tokenizer, tokens, align_map, target
                 break
         
         if is_start_of_span:
-            # 这是一个变量的开始，插入一个 mask
+            # This is the start of a variable; insert one mask
             masked_token_ids.append(mask_token_id)
             mask_indices_in_new_list.append(len(masked_token_ids) - 1)
-            # 跳过这个变量原来的所有 token
+            # Skip all original tokens of this variable
             i += span_len
         else:
-            # 普通 token，照搬
+            # Regular token; copy as-is
             masked_token_ids.append(token_ids_raw[i])
             i += 1
     model_max_len = 512
 
-    target_mask_idx = mask_indices_in_new_list[0] # 取第一个 mask 位置
+    target_mask_idx = mask_indices_in_new_list[0] # use the first mask position
 
     print("Start Predicting Words!")
-    # 3. 模型预测
+    # 3. Model prediction
     if len(masked_token_ids) > model_max_len:
-        # 计算窗口的起止位置
-        # 尽量让 mask 位于窗口中间
+        # Calculate the start and end positions of the window
+        # Try to place the mask near the center of the window
         half_window = model_max_len // 2
         start = max(0, target_mask_idx - half_window)
         end = min(len(masked_token_ids), start + model_max_len)
         
-        # 修正 start：如果 end 到底了，start 要往前挪，保证凑够 512
+        # Adjust start: if end reaches the tail, move start backward to keep the window length at 512
         if end - start < model_max_len:
             start = max(0, end - model_max_len)
             
-        # 截取窗口
+        # Slice the window
         window_input_ids = masked_token_ids[start:end]
         
-        # 修正 mask 在新窗口中的索引
+        # Adjust the mask index within the new window
         relative_mask_idx = target_mask_idx - start
         
-        # 构造 Tensor
-        # 1. 输入：把整个窗口喂进去，为了提供上下文
+        # Build the tensor
+        # 1. Input: feed the entire window to provide context
         input_tensor = torch.tensor([window_input_ids]).to(model.device)
         
         with torch.no_grad():
@@ -209,11 +209,11 @@ def generate_candidates_for_variable(model, tokenizer, tokens, align_map, target
             # predictions shape: [Batch=1, Seq_Len=512, Vocab_Size=50265]
             predictions = outputs.logits 
             
-        # 2. 提取：只看 Mask 那个位置的预测结果
-        # 哪怕模型输出了 512 个位置的预测，我们只取 relative_mask_idx 这一行
+        # 2. Extract: only use the prediction at the mask position
+        # Even if the model outputs predictions for 512 positions, only take the row at relative_mask_idx
         target_token_logits = predictions[0, relative_mask_idx] 
         
-        # 3. 排序取 Top-K
+        # 3. Sort and take Top-K
         top_k_probs, top_k_ids = torch.topk(target_token_logits, top_k)
     else:
         input_tensor = torch.tensor([masked_token_ids]).to(model.device)
@@ -222,9 +222,9 @@ def generate_candidates_for_variable(model, tokenizer, tokens, align_map, target
             outputs = model(input_tensor)
             predictions = outputs.logits # [1, seq_len, vocab_size]
             
-        # 4. 提取候选词
-        # 我们通常取所有 mask 位置预测结果的综合（例如取第一个 mask 的预测，或者取所有 mask 预测的交集/乘积）
-        # ALERT 简单做法：只看第一个 mask 的预测结果即可（因为上下文是双向的，模型知道所有 mask 是同一个变量）
+        # 4. Extract candidate words
+        # Usually aggregate predictions across all mask positions (for example, use the first mask prediction or the intersection/product of all mask predictions)
+        # ALERT's simple approach: use only the first mask prediction (the context is bidirectional, so the model knows all masks refer to the same variable)
         
         probs = predictions[0, target_mask_idx] # [vocab_size]
         
@@ -233,7 +233,7 @@ def generate_candidates_for_variable(model, tokenizer, tokens, align_map, target
     results = []
     for idx in top_k_ids:
         word = tokenizer.decode([idx]).strip()
-        # 简单过滤：剔除原来的名字，剔除特殊字符
+        # Simple filtering: remove the original name and special characters
         if word != target_var_name and word.isidentifier() and is_not_keyword(word):
         # if word != target_var_name and word.isidentifier():
             results.append(word)
@@ -241,15 +241,15 @@ def generate_candidates_for_variable(model, tokenizer, tokens, align_map, target
 
 def generate_candidates_for_variable_codet5(model, tokenizer, tokens, align_map, target_var_name, top_k=30):
     """
-    针对指定的变量名 (target_var_name)，使用 CodeT5 生成替换候选词。
-    策略：
-    1. 将该变量的所有 token 替换为 <extra_id_0>。
-    2. 使用 model.generate 生成 top_k 个序列。
-    3. 解析序列提取单词。
+    Generate replacement candidates for the specified variable name (target_var_name) using CodeT5.
+    Strategy:
+    1. Replace all tokens of this variable with <extra_id_0>.
+    2. Use model.generate to generate top_k sequences.
+    3. Parse the sequences to extract words.
     """
     
     # ==========================
-    # 1. 找到变量的所有位置 (逻辑同 CodeBERT)
+    # 1. Find all positions of the variable (same logic as CodeBERT)
     # ==========================
     occurrences = [] 
     current_span = []
@@ -267,15 +267,15 @@ def generate_candidates_for_variable_codet5(model, tokenizer, tokens, align_map,
         return []
 
     # ==========================
-    # 2. 构建 Masked Input IDs
+    # 2. Build masked input IDs
     # ==========================
     masked_token_ids = []
     token_ids_raw = tokenizer.convert_tokens_to_ids(tokens)
     
-    # CodeT5 的哨兵 ID (Sentinel Token)
-    # 对于 codet5-base, <extra_id_0> 的 ID 通常是 32099
-    # 如果 tokenizer 加载了特殊 token，也可以用 tokenizer.convert_tokens_to_ids('<extra_id_0>')
-    # 这里为了稳健，优先尝试获取，获取不到则用默认值
+    # CodeT5 sentinel ID (sentinel token)
+    # For codet5-base, the ID of <extra_id_0> is usually 32099
+    # If the tokenizer loads special tokens, tokenizer.convert_tokens_to_ids('<extra_id_0>') can also be used
+    # For robustness, try to retrieve it first; if retrieval fails, use the default value
     sentinel_id = tokenizer.convert_tokens_to_ids('<extra_id_0>')
     if sentinel_id == tokenizer.unk_token_id:
         sentinel_id = 32099 
@@ -294,7 +294,7 @@ def generate_candidates_for_variable_codet5(model, tokenizer, tokens, align_map,
                 break
         
         if is_start_of_span:
-            # 这里的区别：CodeT5 将整个 span 替换为 *一个* 哨兵
+            # Difference here: CodeT5 replaces the entire span with *one* sentinel
             masked_token_ids.append(sentinel_id)
             mask_indices_in_new_list.append(len(masked_token_ids) - 1)
             i += span_len
@@ -303,10 +303,10 @@ def generate_candidates_for_variable_codet5(model, tokenizer, tokens, align_map,
             i += 1
             
     # ==========================
-    # 3. 窗口切分 (Windowing)
+    # 3. Windowing
     # ==========================
     model_max_len = 512
-    target_mask_idx = mask_indices_in_new_list[0] # 以第一个 mask 为中心
+    target_mask_idx = mask_indices_in_new_list[0] # center the window around the first mask
 
     final_input_ids = []
 
@@ -322,36 +322,36 @@ def generate_candidates_for_variable_codet5(model, tokenizer, tokens, align_map,
     else:
         final_input_ids = masked_token_ids
 
-    # 转为 Tensor
+    # Convert to tensor
     input_tensor = torch.tensor([final_input_ids]).to(model.device)
 
     # ==========================
-    # 4. CodeT5 生成 (核心区别)
+    # 4. CodeT5 generation (core difference)
     # ==========================
     print(f"CodeT5 Predicting for: {target_var_name}...")
     
-    # 使用 Beam Search 生成多个结果
+    # Use beam search to generate multiple results
     outputs = model.generate(
         input_tensor, 
-        max_length=16,             # 变量名通常很短，不需要生成太长
-        num_beams=top_k + 5,       # Beam 宽度略大于需要的 k，保证多样性
-        num_return_sequences=top_k,# 返回 k 个序列
+        max_length=16,             # variable names are usually short, so long generation is unnecessary
+        num_beams=top_k + 5,       # beam width is slightly larger than k to improve diversity
+        num_return_sequences=top_k,# return k sequences
         early_stopping=True
     )
     
     # ==========================
-    # 5. 解析与过滤
+    # 5. Parsing and filtering
     # ==========================
     candidates = []
-    seen_candidates = set() # 去重
+    seen_candidates = set() # deduplication
     
     for output_ids in outputs:
-        # 解码
+        # Decode
         raw_text = tokenizer.decode(output_ids, skip_special_tokens=False)
         # print(f"Raw Generated Text: {raw_text}")
         
-        # 解析：标准格式是 "<pad> <extra_id_0> prediction <extra_id_1> </s>"
-        # 也有可能是 "<pad> <s> <extra_id_0> prediction <extra_id_1> </s>"
+        # Parse: the standard format is "<pad> <extra_id_0> prediction <extra_id_1> </s>"
+        # It may also be "<pad> <s> <extra_id_0> prediction <extra_id_1> </s>"
         text_content = raw_text.replace("<pad>", "").replace("</s>", "").replace("<s>", "").strip()
         
         predicted_word = ""
@@ -367,17 +367,17 @@ def generate_candidates_for_variable_codet5(model, tokenizer, tokens, align_map,
             preds = re.findall(r'[a-zA-Z_]\w*', predicted_word)
             predicted_word = preds[0] if preds else predicted_word
 
-        # 如果解析失败，可能是纯文本，直接用
+        # If parsing fails, the output may be plain text; use it directly
         if not predicted_word:
              predicted_word = text_content.replace("<extra_id_0>", "").strip()
 
-        # --- 过滤逻辑 ---
+        # --- Filtering logic ---
         if not predicted_word: continue
         
-        # 1. 去除空格 (CodeT5 有时会生成带 'Ġ' 效果的空格，decode 后就是普通空格)
+        # 1. Remove whitespace (CodeT5 may generate spaces with a 'Ġ'-like effect; after decoding they are normal spaces)
         predicted_word = predicted_word.strip()
         
-        # 2. 排除原名, 非标识符，关键字, 去重
+        # 2. Exclude the original name, non-identifiers, keywords, and duplicates
         if predicted_word != target_var_name and predicted_word.isidentifier() and is_not_keyword(predicted_word) and predicted_word not in seen_candidates:
             seen_candidates.add(predicted_word)
             candidates.append(predicted_word)
@@ -390,24 +390,24 @@ def generate_candidates_for_variable_codet5(model, tokenizer, tokens, align_map,
 
 def init_mlm(device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
     """
-    线程安全 + 进程单例缓存版本。
-    所有线程共享同一份 CodeBert,GPU 显存只占 1 份(原本 4 线程 = 4 份)。
-    签名与原版一致,上游 {atk_name}.py 一行不动。
+    Thread-safe version with a process-level singleton cache.
+    All threads share one CodeBERT instance, so GPU memory stores only one copy (previously four threads meant four copies).
+    The signature matches the original version, so upstream {atk_name}.py does not need any changes.
     """
     key = (LOCAL_CODEBERT_PATH, str(device))
 
-    # 快路径:无锁读取
+    # Fast path: lock-free read
     cached = _MLM_MODEL_CACHE.get(key)
     if cached is not None:
         return cached
 
-    # 慢路径:双重检查锁,首次访问以外开销为零
+    # Slow path: double-checked locking; zero overhead after the first access
     with _MLM_MODEL_LOCK:
         cached = _MLM_MODEL_CACHE.get(key)
         if cached is not None:
             return cached
-        print(f"[init_mlm] 首次加载 CodeBert: {LOCAL_CODEBERT_PATH} -> {device}")
-        # print(f"[init_mlm] 首次加载 CodeBert: {LOCAL_CODET5_PATH} -> {device}")
+        print(f"[init_mlm] Loading CodeBERT for the first time: {LOCAL_CODEBERT_PATH} -> {device}")
+        # print(f"[init_mlm] Loading CodeBERT for the first time: {LOCAL_CODET5_PATH} -> {device}")
         model = RobertaForMaskedLM.from_pretrained(LOCAL_CODEBERT_PATH)
         # model = T5ForConditionalGeneration.from_pretrained(LOCAL_CODET5_PATH)
         model.eval()
@@ -417,9 +417,9 @@ def init_mlm(device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
 def _get_aligner(model_name, lang='cpp'):
     """
-    线程本地的 CodeBertTokenizerAligned 缓存。
-    每个线程首次调用时构造 1 个 aligner 并复用,避免每次 gen_candis_* 都重新
-    加载 RobertaTokenizer (vocab/merges 文件,几十 MB 的反复 IO)。
+    Thread-local CodeBertTokenizerAligned cache.
+    Each thread builds one aligner on its first call and reuses it, avoiding repeated
+    RobertaTokenizer loading (vocab/merges files and repeated tens-of-MB I/O) on every gen_candis_* call.
     """
     cache = getattr(_aligner_local, 'cache', None)
     if cache is None:
@@ -434,13 +434,13 @@ def _get_aligner(model_name, lang='cpp'):
 
 def gen_candis(code, mlm_model, target_var, *, _precomputed=None):
     """
-    生成 CodeBERT 候选词。
+    Generate CodeBERT candidate words.
     
     Parameters
     ----------
     _precomputed : tuple | None
-        若提供 (tokens, align_map, tokenizer)，则跳过重复的 tokenize 步骤。
-        可通过 precompute_tokenize() 获取。
+        If (tokens, align_map, tokenizer) is provided, skip the repeated tokenize step.
+        It can be obtained via precompute_tokenize().
     """
     if _precomputed is not None:
         tokens, align_map, tokenizer = _precomputed
@@ -455,13 +455,13 @@ def gen_candis(code, mlm_model, target_var, *, _precomputed=None):
 
 def gen_candis_codet5(code, mlm_model, target_var, *, _precomputed=None):
     """
-    生成 CodeT5 候选词。
+    Generate CodeT5 candidate words.
     
     Parameters
     ----------
     _precomputed : tuple | None
-        若提供 (tokens, align_map, tokenizer)，则跳过重复的 tokenize 步骤。
-        可通过 precompute_tokenize_codet5() 获取。
+        If (tokens, align_map, tokenizer) is provided, skip the repeated tokenize step.
+        It can be obtained via precompute_tokenize_codet5().
     """
     if _precomputed is not None:
         tokens, align_map, tokenizer = _precomputed
@@ -477,9 +477,9 @@ def gen_candis_codet5(code, mlm_model, target_var, *, _precomputed=None):
 
 def precompute_tokenize(code, lang='cpp'):
     """
-    对代码做一次 CodeBERT tokenize，返回 (tokens, align_map, tokenizer) 三元组。
-    后续对同一份代码的多个变量生成候选时，将此结果传入
-    gen_candis(..., _precomputed=result) 即可避免重复 tokenize。
+    Tokenize the code once with CodeBERT and return the (tokens, align_map, tokenizer) tuple.
+    When generating candidates for multiple variables in the same code later, pass this result to
+    gen_candis(..., _precomputed=result) to avoid repeated tokenization.
     """
     aligner = _get_aligner(LOCAL_CODEBERT_PATH, lang=lang)
     tokens, align_map = aligner.tokenize_with_alignment(code)
@@ -488,9 +488,9 @@ def precompute_tokenize(code, lang='cpp'):
 
 def precompute_tokenize_codet5(code, lang='cpp'):
     """
-    对代码做一次 CodeT5 tokenize，返回 (tokens, align_map, tokenizer) 三元组。
-    后续对同一份代码的多个变量生成候选时，将此结果传入
-    gen_candis_codet5(..., _precomputed=result) 即可避免重复 tokenize。
+    Tokenize the code once with CodeT5 and return the (tokens, align_map, tokenizer) tuple.
+    When generating candidates for multiple variables in the same code later, pass this result to
+    gen_candis_codet5(..., _precomputed=result) to avoid repeated tokenization.
     """
     aligner = _get_aligner(LOCAL_CODET5_PATH, lang=lang)
     tokens, align_map = aligner.tokenize_with_alignment(code)
@@ -500,18 +500,18 @@ import numpy as np
 
 def most_dissimilar_w2v_fast(wv, target, top_k=10, exclude=None):
     """
-    从 wv 中找与 target 最不相似的 top_k 个词。
+    Find the top_k words in wv that are least similar to target.
 
-    target 可以是:
-      1. str: 词表中的 token
-      2. np.ndarray/list: 已经算好的向量，比如 mean_vec
+    target can be:
+      1. str: a token in the vocabulary
+      2. np.ndarray/list: a precomputed vector, such as mean_vec
 
     Returns:
       List[(word, similarity)]
     """
     exclude = set(exclude or [])
 
-    # case 1: target 是词表 token
+    # case 1: target is a vocabulary token
     if isinstance(target, str):
         if target not in wv.key_to_index:
             return []
@@ -519,7 +519,7 @@ def most_dissimilar_w2v_fast(wv, target, top_k=10, exclude=None):
         target_vec = wv.get_vector(target, norm=True)
         exclude.add(target)
 
-    # case 2: target 是向量，比如 mean_vec
+    # case 2: target is a vector, such as mean_vec
     else:
         target_vec = np.asarray(target, dtype=np.float32).reshape(-1)
 
@@ -536,13 +536,13 @@ def most_dissimilar_w2v_fast(wv, target, top_k=10, exclude=None):
 
         target_vec = target_vec / norm
 
-    # 所有词向量，已归一化
+    # All word vectors, already normalized
     all_vecs = wv.get_normed_vectors()
 
     # cosine similarity
     sims = np.dot(all_vecs, target_vec)
 
-    # 排除已有变量名 / 原词
+    # Exclude existing variable names / the original word
     for word in exclude:
         idx = wv.key_to_index.get(word)
         if idx is not None:
@@ -553,7 +553,7 @@ def most_dissimilar_w2v_fast(wv, target, top_k=10, exclude=None):
     if k <= 0:
         return []
 
-    # 取 similarity 最小的 k 个
+    # Take the k entries with the smallest similarity
     idx = np.argpartition(sims, k - 1)[:k]
     idx = idx[np.argsort(sims[idx])]
 
@@ -563,45 +563,45 @@ def most_dissimilar_w2v_fast(wv, target, top_k=10, exclude=None):
     ]
 
 def generate_candidates_w2v(
-    wv,          # 已加载的 gensim Word2Vec 词表
-    target_var: str,    # 目标变量名，如 "sushu_counter"
-    top_k: int = 5,    # 返回候选词数量
+    wv,          # loaded gensim Word2Vec vocabulary
+    target_var: str,    # target variable name, such as "sushu_counter"
+    top_k: int = 5,    # number of candidate words to return
 ) -> list:
     """
-    基于 Word2Vec 余弦相似度生成候选标识符。
+    Generate candidate identifiers based on Word2Vec cosine similarity.
 
-    策略：
-      1. 直接查询 target_var 是否在 W2V 词表中
-      2. 若不在（OOV），尝试拆分下划线子词后取均值向量查询
-      3. 过滤：剔除原词、非标识符、C++ 关键字
+    Strategy:
+      1. Directly check whether target_var is in the W2V vocabulary
+      2. If it is not in the vocabulary (OOV), split underscore subwords and query using their mean vector
+      3. Filter out the original word, non-identifiers, and C++ keywords
     """
 
-    # ── 情况 1：词直接在词表中 ───────────────────────────────────────────────
+    # ── Case 1: the word is directly in the vocabulary ─────────────────────────
     if target_var in wv:
-        similar = wv.most_similar(target_var, topn=top_k * 2)  # 多取一些，过滤后剩 top_k
+        similar = wv.most_similar(target_var, topn=top_k * 2)  # fetch extra items so top_k remain after filtering
         # similar = most_dissimilar_w2v_fast(wv,target_var,top_k * 2)
 
-    # ── 情况 2：OOV，尝试子词均值（处理 snake_case 变量名）───────────────────
+    # ── Case 2: OOV; try the mean of subword vectors for snake_case variable names ──
     else:
         parts = [p for p in re.split(r'[_\d]+', target_var) if p and p in wv]
         if not parts:
-            # 完全 OOV，无法处理
-            print(f"[W2V] '{target_var}' 及其子词均不在词表中，返回空列表")
+            # Completely OOV; cannot process
+            print(f"[W2V] '{target_var}' and its subwords are not in the vocabulary; returning an empty list")
             return []
 
         import numpy as np
         mean_vec = np.mean([wv[p] for p in parts], axis=0)
         similar  = wv.most_similar([mean_vec], topn=top_k * 2)
         # similar = most_dissimilar_w2v_fast(wv,mean_vec,top_k * 2)
-        print(f"[W2V] '{target_var}' OOV，用子词 {parts} 的均值向量查询")
+        print(f"[W2V] '{target_var}' is OOV; querying with the mean vector of subwords {parts}")
 
-    # ── 过滤 ─────────────────────────────────────────────────────────────────
+    # ── Filtering ──────────────────────────────────────────────────────────────
     candidates = []
     for word, score in similar:
         if (
-            word != target_var          # 不是原词本身
-            and word.isidentifier()     # 合法标识符
-            and is_not_keyword(word)    # 不是关键字
+            word != target_var          # not the original word itself
+            and word.isidentifier()     # valid identifier
+            and is_not_keyword(word)    # not a keyword
         ):
             candidates.append(word)
         if len(candidates) >= top_k:
@@ -610,15 +610,15 @@ def generate_candidates_w2v(
     return candidates
 
 
-# ── 替换原来的 gen_candis ─────────────────────────────────────────────────────
+# ── Replacement for the original gen_candis ────────────────────────────────
 def gen_candis_w2v(
     target_var: str,
     wv,
     top_k: int = 30,
 ) -> list:
     """
-    直接替换原来的 gen_candis()。
-    不再需要 code、mlm_model、aligner，接口更简洁。
+    Direct replacement for the original gen_candis().
+    code, mlm_model, and aligner are no longer needed, so the interface is simpler.
     """
     return generate_candidates_w2v(wv, target_var, top_k)
     
@@ -714,11 +714,11 @@ int FUN1(char* VAR1) {
 }                                                                                                             
 '''
 
-    # print(f"\n原始代码: {code}\n")
+    # print(f"\nOriginal code: {code}\n")
     
     tokens, align_map = aligner.tokenize_with_alignment(code)
     
-    # # 模拟攻击：找到所有 'sushu' 的 token index
+    # # Simulated attack: find all token indices for 'sushu'
     # attack_indices = []
     
     # for i, token in enumerate(tokens):
@@ -732,12 +732,12 @@ int FUN1(char* VAR1) {
     #     if source_text == 'sushu':
     #         attack_indices.append(i)
 
-    # print(f"\n[攻击目标定位] 变量 'sushu' 对应的 Token Indices: {attack_indices}")
-    # print("这意味着如果你要 Mask 'sushu'，你需要把这些位置的 ID 都替换成 <mask>。")
+    # print(f"\n[Attack target localization] Token indices corresponding to variable 'sushu': {attack_indices}")
+    # print("This means that if you want to mask 'sushu', you need to replace the IDs at these positions with <mask>.")
 
-    # 加载模型
+    # Load the model
     model = init_mlm()
     target_var = 'VAR1'
     candidates = generate_candidates_for_variable(model, aligner.tokenizer, tokens, align_map, target_var)
 
-    print(f"变量 '{target_var}' 的 CodeBERT 推荐替换词: {candidates}")
+    print(f"CodeBERT recommended replacement words for variable '{target_var}': {candidates}")

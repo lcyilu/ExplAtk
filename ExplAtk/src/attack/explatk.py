@@ -1,10 +1,10 @@
 """
-ExplAtk: 基于解释器引导的迭代式对抗攻击
-==========================================
+ExplAtk: Explainer-guided iterative adversarial attack
+=======================================================
 
-攻击流程：
-  阶段一: GA Token 级攻击（遗传算法 + 解释器 importance 引导）
-  阶段二: DDG/CDG 边引导的结构变换攻击
+Attack workflow:
+  Stage 1: GA token-level attack (genetic algorithm + explainer importance guidance)
+  Stage 2: Structure transformation attack guided by DDG/CDG edges
 """
 
 import re
@@ -38,42 +38,42 @@ from src.attack.ts_transforms import (
     create_tracker_from_code,
     RobustLineTracker,
 )
-from src.pre.attack_trace import AttackTraceLogger
+from src.utils.attack_trace import AttackTraceLogger
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 MLM = init_mlm()
 
 # ──────────────────────────────────────────────────────────────────────
-# 消融实验默认模式（改这里就能切换全局默认行为，无需改上游调用）
+# Default ablation mode (change here to switch global default behavior without changing upstream calls)
 #   "token_only"  : Explain(v0) → Token
-#   "struct_only" : Explain(v0) → 结构变换
-#   "full"        : Explain(v0) → Token → Re-Explain → 结构变换  （论文主线）
+#   "struct_only" : Explain(v0) → structure transformation
+#   "full"        : Explain(v0) → Token → Re-Explain → structure transformation (main paper pipeline)
 # ──────────────────────────────────────────────────────────────────────
 DEFAULT_MODE = "token_only"
 
 # ──────────────────────────────────────────────────────────────────────
-# Adaptive Re-Explanation 阈值
-#   conf_drop = original_true_conf - best_true_conf  （token 阶段把 true_conf 压低了多少）
-#   - drop < DELTA_LOW   : token 几乎没动模型 → 解释信号也不会有大变化，跳过 re-explain
-#   - drop > DELTA_HIGH  : token 已经把 true_conf 压得很低 → 接近翻转，省下解析开销直接做结构变换
-#   - 其余区间           : 做 re-explain（信息增量最大的"甜区"）
-# 关闭自适应时（adaptive_reexplain=False），不论 drop 多少都做 re-explain。
+# Adaptive Re-Explanation thresholds
+#   conf_drop = original_true_conf - best_true_conf  (how much the token stage lowers true_conf)
+#   - drop < DELTA_LOW   : the token stage barely changes the model → explanation signals are unlikely to change much, so skip re-explain
+#   - drop > DELTA_HIGH  : the token stage already lowers true_conf substantially → close to flipping, so skip parsing overhead and run structure transformation directly
+#   - otherwise          : run re-explain (the information-gain sweet spot)
+# When adaptation is disabled (adaptive_reexplain=False), always run re-explain regardless of drop.
 # ──────────────────────────────────────────────────────────────────────
 DELTA_LOW = 0.05
 DELTA_HIGH = 0.40
 
 # ──────────────────────────────────────────────────────────────────────
-# 解释器选择开关
+# Explainer selection switch
 # ──────────────────────────────────────────────────────────────────────
-# 修改这一处即可全局切换解释器（不改任何调用方）。
-# 可选值: "coca" | "robust"
+# Change this setting to switch the explainer globally without changing any callers.
+# Options: "coca" | "robust"
 DEFAULT_EXPLAINER = "robust"
 
 # ──────────────────────────────────────────────────────────────────────
-# Token GA guidance 选择开关
+# Token GA guidance selection switch
 # ──────────────────────────────────────────────────────────────────────
-# 默认 explanation，保证上游批量实验不改调用、不增加 masking 查询开销。
-# 可选值: "explanation" | "random" | "masking"
+# Default to explanation to keep upstream batch experiments unchanged and avoid extra masking queries.
+# Options: "explanation" | "random" | "masking"
 DEFAULT_GUIDANCE_MODE = "explanation"
 VALID_GUIDANCE_MODES = {"explanation", "random", "masking"}
 
@@ -85,11 +85,11 @@ from src.utils.gen_embedding import read_json
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 基础设施
+# Infrastructure
 # ══════════════════════════════════════════════════════════════════════
 
 class LineTracker:
-    """跨阶段行号偏移追踪。"""
+    """Track line-number offsets across stages."""
 
     def __init__(self):
         self.offsets = []
@@ -106,7 +106,7 @@ class LineTracker:
 
 
 class RenameMap:
-    """跨阶段变量重命名追踪，供数据流阶段解析 dep_variable。"""
+    """Track variable renaming across stages for resolving dep_variable in the data-flow stage."""
 
     def __init__(self):
         self.mapping = {}
@@ -125,10 +125,10 @@ class RenameMap:
 
 class AttackState:
     """
-    全程追踪攻击过程中的关键变体：
-      best_variant:          true_conf 最低的变体（置信度下降最大）
-      first_success_variant: 第一个翻转预测的变体
-      final_variant:         最终变体
+    Track key variants throughout the attack process:
+      best_variant:          variant with the lowest true_conf (largest confidence drop)
+      first_success_variant: first variant that flips the prediction
+      final_variant:         final variant
     """
 
     def __init__(self, original_true_conf):
@@ -154,11 +154,11 @@ class AttackState:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 辅助函数
+# Helper functions
 # ══════════════════════════════════════════════════════════════════════
 
 def _negate_simple_expr(expr):
-    """对简单表达式取反。"""
+    """Negate a simple expression."""
     expr = expr.strip()
     if expr.startswith('!'):
         return expr[1:].strip()
@@ -171,14 +171,14 @@ def _negate_simple_expr(expr):
 
 
 def _to_str(code):
-    """统一转为 str。"""
+    """Convert input to str consistently."""
     if isinstance(code, bytes):
         return code.decode('utf-8')
     return code
 
 
 def _query_from_lines(lines, wrapper, true_label, state):
-    """从代码行列表构建嵌入并查询模型，更新状态。返回 (是否翻转, 代码字符串)。"""
+    """Build an embedding from code lines, query the model, update state, and return (flipped, code string)."""
     code_str = '\n'.join(lines)
     proposed_data = src2embedding(code_str.encode('utf-8'), true_label).to(DEVICE)
     pred, true_conf = wrapper.predict_label_and_true_conf(proposed_data, true_label)
@@ -196,12 +196,12 @@ def _get_explainer(expl_name, wrapper:ModelWrapper):
 def _should_reexplain(original_true_conf, best_true_conf,
                       delta_low=DELTA_LOW, delta_high=DELTA_HIGH):
     """
-    Adaptive Re-Explanation 触发判据。
+    Adaptive Re-Explanation triggering criterion.
 
     Args:
-        original_true_conf: 原始代码上的 true-label 置信度
-        best_true_conf:     token 阶段所达到的最低 true-label 置信度
-        delta_low / delta_high: 上下阈值（来自模块级常量，可被参数覆盖）
+        original_true_conf: true-label confidence on the original code
+        best_true_conf:     lowest true-label confidence reached by the token stage
+        delta_low / delta_high: lower and upper thresholds (from module-level constants, can be overridden)
 
     Returns:
         (do_reexplain: bool, reason: str)
@@ -209,19 +209,19 @@ def _should_reexplain(original_true_conf, best_true_conf,
     drop = original_true_conf - best_true_conf
     if drop < delta_low:
         return False, (
-            f"drop={drop:.4f} < δ_low={delta_low:.2f}，token 阶段几乎未撼动模型，"
-            f"重新解释信息增量低，跳过"
+            f"drop={drop:.4f} < delta_low={delta_low:.2f}; the token stage barely changes the model; "
+            f"re-explanation has low information gain, skipping"
         )
     if drop > delta_high:
         return False, (
-            f"drop={drop:.4f} > δ_high={delta_high:.2f}，token 阶段已显著压低置信度，"
-            f"省下解析开销直接做结构变换"
+            f"drop={drop:.4f} > delta_high={delta_high:.2f}; the token stage has substantially lowered confidence; "
+            f"skipping parsing overhead and running structure transformation directly"
         )
-    return True, f"drop={drop:.4f} ∈ [{delta_low:.2f}, {delta_high:.2f}]，处于信息增量甜区"
+    return True, f"drop={drop:.4f} in [{delta_low:.2f}, {delta_high:.2f}]; information-gain sweet spot"
 
 
 def _identifier_lines(source_code, identifiers):
-    """返回每个 identifier 在源码中出现过的行号，供不同 guidance 结果格式保持一致。"""
+    """Return the line numbers where each identifier appears in the source code to normalize guidance formats."""
     source_text = source_code if isinstance(source_code, str) else source_code.decode('utf-8')
     lines = source_text.split('\n')
     line_map = {}
@@ -232,7 +232,7 @@ def _identifier_lines(source_code, identifiers):
 
 
 def _random_identifier_importance(source_code, lang='c'):
-    """Random guidance：只随机化 identifier 优先级，不额外查询模型。"""
+    """Random guidance: randomize only identifier priorities without extra model queries."""
     code_bytes = source_code.encode('utf-8') if isinstance(source_code, str) else source_code
     raw_ids = extract_identifiers_from_one_src(code_bytes, lang=lang)
     unique_ids = list(set(raw_ids))
@@ -255,8 +255,8 @@ def _random_identifier_importance(source_code, lang='c'):
 def _masking_identifier_importance(current_code_str, current_pdg, wrapper: ModelWrapper,
                                    wv, true_label, lang='c', verbose=False):
     """
-    Masking guidance：参考 masking.py，用把 identifier 替换为 MASK 后的 true-label
-    confidence drop 作为 importance。仅在 guidance_mode="masking" 时调用。
+    Masking guidance: following masking.py, use the true-label
+    confidence drop after replacing an identifier with MASK as its importance. Called only when guidance_mode="masking".
     """
     from src.config import MASK
 
@@ -291,11 +291,11 @@ def _masking_identifier_importance(current_code_str, current_pdg, wrapper: Model
 def _get_guided_identifier_importance(guidance_mode, current_code_str, current_pdg,
                                       mapping, wrapper: ModelWrapper, wv,
                                       true_label, lang='c', verbose=False):
-    """按 guidance_mode 生成统一的 [{'name', 'importance', 'lines'}] 排序列表。"""
+    """Generate a unified sorted list of [{'name', 'importance', 'lines'}] according to guidance_mode."""
     mode = (guidance_mode or DEFAULT_GUIDANCE_MODE).lower()
     if mode not in VALID_GUIDANCE_MODES:
         raise ValueError(
-            f"guidance_mode 必须是 {sorted(VALID_GUIDANCE_MODES)}，收到 {guidance_mode!r}"
+            f"guidance_mode must be one of {sorted(VALID_GUIDANCE_MODES)}, got {guidance_mode!r}"
         )
 
     if mode == "explanation":
@@ -308,23 +308,23 @@ def _get_guided_identifier_importance(guidance_mode, current_code_str, current_p
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 阶段一：Token 级攻击
+# Stage 1: token-level attack
 # ══════════════════════════════════════════════════════════════════════
 
 def _attack_token(current_code_str, mapping, wrapper: ModelWrapper, wv, true_label, 
                   rename_map, state, lang, max_attempts):
     """
-    Token 级攻击：使用 Word2Vec 寻找候选词，通过修改 PDG 节点属性进行快速评估。
+    Token-level attack: use Word2Vec to find candidates and quickly evaluate them by modifying PDG node attributes.
     """
     current_pdg = src2pdg(current_code_str)
     attempts = 0
 
-    # 1. 初始化环境：提取代码中所有可替换的标识符
+    # 1. Initialize the environment: extract all replaceable identifiers from the code
     raw_ids = extract_identifiers_from_one_src(current_code_str.encode('utf-8'), lang)
     unique_identifiers = list(set(raw_ids))
     existing_identifiers = set(raw_ids)
 
-    # 2. 遍历解释器识别出的关键（Vulnerable）节点
+    # 2. Iterate over key (vulnerable) nodes identified by the explainer
     for node in mapping.vulnerable_nodes:
         if attempts >= max_attempts:
             break
@@ -338,19 +338,19 @@ def _attack_token(current_code_str, mapping, wrapper: ModelWrapper, wv, true_lab
 
         line_content = lines[line_idx]
 
-        # 筛选当前行中包含的可替换标识符
+        # Filter replaceable identifiers contained in the current line
         line_targets = [
             v for v in unique_identifiers
             if re.search(r'\b' + re.escape(v) + r'\b', line_content)
         ]
         print(f"Targeting identifiers in line {line_no}: {line_targets}")
 
-        # 3. 对当前行的每个变量尝试替换
+        # 3. Try replacements for each variable in the current line
         for target_var in line_targets:
             if attempts >= max_attempts:
                 break
 
-            # 生成 W2V 候选词并过滤掉已存在的标识符
+            # Generate W2V candidates and filter out existing identifiers
             candidates = gen_candis_w2v(target_var, wv, top_k=5)
             if not candidates:
                 continue
@@ -359,12 +359,12 @@ def _attack_token(current_code_str, mapping, wrapper: ModelWrapper, wv, true_lab
             if not valid_candidates:
                 continue
 
-            # 4. 尝试每个候选词
+            # 4. Try each candidate
             for id_candi in valid_candidates:
                 if attempts >= max_attempts:
                     break
 
-                # 使用快速路径：直接修改 PDG 节点特征，无需重新生成 CPG/PDG
+                # Use the fast path: directly modify PDG node features without regenerating CPG/PDG
                 proposed_data = renamed_pdg_to_embedding(
                     current_pdg, wv, target_var, id_candi, true_label
                 ).to(DEVICE)
@@ -374,32 +374,32 @@ def _attack_token(current_code_str, mapping, wrapper: ModelWrapper, wv, true_lab
                 )
                 attempts += 1
 
-                # 生成替换后的源码字符串
+                # Generate the source-code string after replacement
                 proposed_code = _to_str(
                     rename_identifier(current_code_str, target_var, id_candi, lang)
                 )
                 
-                # 更新全局攻击状态记录
+                # Update the global attack state
                 state.update(proposed_code, pred, true_conf, true_label)
 
-                # 如果标签成功翻转，直接返回成功结果
+                # If the label is successfully flipped, return immediately
                 if pred != true_label:
                     rename_map.add(target_var, id_candi)
                     return True, proposed_code
 
-            # 5. 累积扰动处理：
-            # 如果本轮所有候选词都未能翻转标签，默认保留第一个候选词（贪心累积）
-            # 注意：此处可根据建议改为“仅保留能降低置信度的最佳候选”
+            # 5. Accumulated perturbation handling:
+            # If no candidate in this round flips the label, keep the first candidate by default (greedy accumulation)
+            # Note: this can be changed to "keep only the best candidate that lowers confidence" if desired
             best = valid_candidates[0]
             current_code_str = _to_str(
                 rename_identifier(current_code_str, target_var, best, lang)
             )
             
-            # 应用累积扰动后，必须重新解析 PDG，以确保下一轮替换在正确的图结构上进行
+            # After applying accumulated perturbations, reparse the PDG to ensure the next replacement uses the correct graph structure
             current_pdg = src2pdg(current_code_str)
             rename_map.add(target_var, best)
 
-            # 更新当前代码的标识符集合
+            # Update the identifier set of the current code
             existing_identifiers.discard(target_var)
             existing_identifiers.add(best)
             unique_identifiers = [best if v == target_var else v for v in unique_identifiers]
@@ -409,19 +409,19 @@ def _attack_token(current_code_str, mapping, wrapper: ModelWrapper, wv, true_lab
 def _attack_token_drop(current_code_str, mapping, wrapper: ModelWrapper, wv, true_label,
                        rename_map, state, lang, max_attempts):
     """
-    Token 级攻击：
-    优先选择能显著降低 margin 的替换；
-    若没有降低 margin 的候选，则默认保留第一个合法候选。
+    Token-level attack:
+    Prefer replacements that significantly reduce the margin;
+    If no candidate reduces the margin, keep the first valid candidate by default.
 
     margin = true_conf - other_conf
 
-    margin 越小，越接近攻击成功；
-    margin < 0 时，说明 other_label 分数已经超过 true_label，预测发生翻转。
+    The smaller the margin, the closer the attack is to success;
+    When margin < 0, the other_label score exceeds the true_label score and the prediction flips.
     """
     current_pdg = src2pdg(current_code_str)
     attempts = 0
 
-    # 获取初始 margin 作为基准
+    # Get the initial margin as the baseline
     initial_data = pdg2embedding(current_pdg, wv, true_label).to(torch.device(DEVICE))
 
     _, current_baseline_conf, current_baseline_margin = \
@@ -433,7 +433,7 @@ def _attack_token_drop(current_code_str, mapping, wrapper: ModelWrapper, wv, tru
     unique_identifiers = list(set(raw_ids))
     existing_identifiers = set(raw_ids)
 
-    # 缓存 tokenize 结果，代码变化时失效重算
+    # Cache tokenize results and recompute only when the code changes
     _cached_code_for_tokenize = None
     _cached_precomputed = None
 
@@ -459,7 +459,7 @@ def _attack_token_drop(current_code_str, mapping, wrapper: ModelWrapper, wv, tru
             if attempts >= max_attempts:
                 break
 
-            # 复用 tokenize 结果：只有代码变化时重新 tokenize
+            # Reuse tokenize results and retokenize only when the code changes
             if _cached_code_for_tokenize != current_code_str:
                 _cached_code_for_tokenize = current_code_str
                 _cached_precomputed = precompute_tokenize(current_code_str)
@@ -482,14 +482,14 @@ def _attack_token_drop(current_code_str, mapping, wrapper: ModelWrapper, wv, tru
             min_margin_for_var = current_baseline_margin
             best_true_conf_for_var = current_baseline_conf
 
-            # 记录已评估候选的结果，方便 fallback 时更新 baseline
+            # Record evaluated candidate results so the baseline can be updated during fallback
             evaluated_results = {}
 
             for id_candi in valid_candidates:
                 if attempts >= max_attempts:
                     break
 
-                # 快速评估：使用 renamed_pdg_to_embedding 避免频繁重新解析 PDG
+                # Fast evaluation: use renamed_pdg_to_embedding to avoid repeatedly reparsing the PDG
                 proposed_data = renamed_pdg_to_embedding(
                     current_pdg, wv, target_var, id_candi, true_label
                 ).to(torch.device(DEVICE))
@@ -507,7 +507,7 @@ def _attack_token_drop(current_code_str, mapping, wrapper: ModelWrapper, wv, tru
                     )
                 )
 
-                # 存储结构保持不变：仍然记录 true_conf
+                # Keep the stored structure unchanged and still record true_conf
                 state.update(proposed_code_tmp, pred, true_conf, true_label)
 
                 evaluated_results[id_candi] = {
@@ -516,23 +516,23 @@ def _attack_token_drop(current_code_str, mapping, wrapper: ModelWrapper, wv, tru
                     "margin": margin,
                 }
 
-                # 如果成功翻转标签，直接返回
+                # If the label is successfully flipped, return immediately
                 if pred != true_label:
                     rename_map.add(target_var, id_candi)
                     return True, proposed_code_tmp
 
-                # 如果没翻转，寻找能使 margin 下降最多的候选
+                # If not flipped, find the candidate that reduces the margin the most
                 if margin < min_margin_for_var:
                     min_margin_for_var = margin
                     best_true_conf_for_var = true_conf
                     best_candi_for_var = id_candi
 
-            # 如果已经用完 query budget，并且没有评估到任何候选，就不再强行应用 fallback
+            # If the query budget is exhausted and no candidate has been evaluated, do not force fallback
             if attempts >= max_attempts and not evaluated_results:
                 break
 
-            # 优先保留降低 margin 最多的候选；
-            # 如果没有任何候选降低 margin，则默认保留第一个合法候选。
+            # Prefer the candidate that reduces the margin the most;
+            # If no candidate reduces the margin, keep the first valid candidate by default.
             if best_candi_for_var is not None:
                 chosen_candi = best_candi_for_var
                 current_baseline_margin = min_margin_for_var
@@ -545,13 +545,13 @@ def _attack_token_drop(current_code_str, mapping, wrapper: ModelWrapper, wv, tru
                     f"fallback to first candidate: {chosen_candi}"
                 )
 
-                # fallback 候选如果已经评估过，直接用它的结果更新 baseline
+                # If the fallback candidate has already been evaluated, update the baseline directly with its result
                 if chosen_candi in evaluated_results:
                     current_baseline_margin = evaluated_results[chosen_candi]["margin"]
                     current_baseline_conf = evaluated_results[chosen_candi]["true_conf"]
                 else:
-                    # 极少数情况：chosen_candi 没被评估，比如中途达到 max_attempts
-                    # 这里不额外消耗 query，只保留旧 baseline
+                    # Rare case: chosen_candi was not evaluated, for example because max_attempts was reached midway
+                    # Do not spend extra queries here; keep the old baseline
                     pass
 
             current_code_str = _to_str(
@@ -560,7 +560,7 @@ def _attack_token_drop(current_code_str, mapping, wrapper: ModelWrapper, wv, tru
                 )
             )
 
-            # 应用累积扰动后，重新生成 PDG
+            # Regenerate the PDG after applying accumulated perturbations
             current_pdg = src2pdg(current_code_str)
 
             rename_map.add(target_var, chosen_candi)
@@ -597,41 +597,41 @@ def _attack_token_genetic(
     guidance_mode: str = DEFAULT_GUIDANCE_MODE,
 ):
     """
-    基于遗传算法的 Token 级攻击。
+    Token-level attack based on a genetic algorithm.
 
-    染色体编码：
-      - 每个基因对应一个可替换标识符
-      - 基因值 0 = 不替换，1..K = 使用第 k 个 W2V 候选
+    Chromosome encoding:
+      - Each gene corresponds to a replaceable identifier
+      - Gene value 0 = no replacement; 1..K = use the k-th W2V candidate
 
-    适应度：
-      - margin = true_conf - other_conf，越小越好
-      - margin < 0 表示预测翻转（攻击成功）
+    Fitness:
+      - margin = true_conf - other_conf, smaller is better
+      - margin < 0 indicates prediction flipping (attack success)
 
-    Guidance 融合：
-      - guidance_mode 决定 identifier importance 来源：explanation / random / masking
-      - 标识符的 importance 分数影响初始化和变异概率
-      - 高 importance 标识符更可能被替换、更频繁变异
-      - 低 importance 标识符作为兜底，仍有机会参与进化
+    Guidance integration:
+      - guidance_mode determines the identifier importance source: explanation / random / masking
+      - identifier importance scores affect initialization and mutation probabilities
+      - high-importance identifiers are more likely to be replaced and mutated more frequently
+      - low-importance identifiers act as a fallback and can still participate in evolution
 
     Args:
-        current_code_str:   当前源码字符串
-        mapping:            ExplanationMapping 对象
-        wrapper:            ModelWrapper 实例
-        wv:                 gensim Word2Vec 词表
-        true_label:         真实标签
-        rename_map:         RenameMap 对象（记录跨阶段重命名）
-        state:              AttackState 对象
-        lang:               语言标识
-        max_queries:        最大查询预算
-        pop_size:           种群大小
-        max_generations:    最大进化代数
-        top_k_candidates:   每个标识符的 W2V 候选数
-        elite_count:        精英保留数
-        crossover_rate:     交叉概率
-        base_mutation_rate: 基础变异概率
-        batch_eval_size:    批量评估大小（0=逐个评估）
-        verbose:            是否打印详情
-        guidance_mode:      identifier guidance 来源，默认 explanation
+        current_code_str:   current source-code string
+        mapping:            ExplanationMapping object
+        wrapper:            ModelWrapper instance
+        wv:                 gensim Word2Vec vocabulary
+        true_label:         ground-truth label
+        rename_map:         RenameMap object (records renaming across stages)
+        state:              AttackState object
+        lang:               language identifier
+        max_queries:        maximum query budget
+        pop_size:           population size
+        max_generations:    maximum number of generations
+        top_k_candidates:   number of W2V candidates per identifier
+        elite_count:        number of elites to keep
+        crossover_rate:     crossover probability
+        base_mutation_rate: base mutation probability
+        batch_eval_size:    batch evaluation size (0 = evaluate one by one)
+        verbose:            whether to print details
+        guidance_mode:      identifier guidance source; default is explanation
 
     Returns:
         (success: bool, final_code: str)
@@ -641,13 +641,13 @@ def _attack_token_genetic(
     current_pdg = src2pdg(current_code_str)
 
     # ═══════════════════════════════════════════════════════════
-    # Step 1: 构建标识符表 + 候选词表 + 重要性权重
+    # Step 1: Build the identifier table, candidate table, and importance weights
     # ═══════════════════════════════════════════════════════════
 
     guidance_mode = (guidance_mode or DEFAULT_GUIDANCE_MODE).lower()
 
-    # 按 guidance_mode 获取每个标识符的重要性。
-    # explanation 为默认路径；random 不查询模型；masking 才会额外执行 masking importance 查询。
+    # Get the importance of each identifier according to guidance_mode.
+    # explanation is the default path; random does not query the model; only masking performs extra masking-importance queries.
     ranked_identifiers = _get_guided_identifier_importance(
         guidance_mode, current_code_str, current_pdg,
         mapping, wrapper, wv, true_label, lang, verbose=verbose,
@@ -655,18 +655,18 @@ def _attack_token_genetic(
 
     if not ranked_identifiers:
         if verbose:
-            print("[GA] 无可替换标识符")
+            print("[GA] No replaceable identifiers")
         return False, current_code_str
 
-    # 提取当前代码中已有的所有标识符（用于冲突检测）
+    # Extract all identifiers already present in the current code (for conflict detection)
     existing_ids = set(item['name'] for item in ranked_identifiers)
 
-    # 为每个标识符生成 W2V 候选并过滤
-    identifiers = []     # 标识符名称列表
-    candidates = []      # 对应的候选词列表（不含原名）
-    importances = []     # 对应的重要性分数
+    # Generate W2V candidates for each identifier and filter them
+    identifiers = []     # identifier-name list
+    candidates = []      # corresponding candidate list (excluding the original name)
+    importances = []     # corresponding importance scores
 
-    # 预计算：对同一份代码只 tokenize 一次，N 个变量共用结果
+    # Precompute: tokenize the same code only once and share the result across N variables
     _precomputed = precompute_tokenize(current_code_str)
 
     for item in ranked_identifiers:
@@ -679,7 +679,7 @@ def _attack_token_genetic(
         if not candis:
             continue
 
-        # 过滤掉已存在的标识符
+        # Filter out identifiers that already exist
         valid = [c for c in candis if c not in existing_ids]
         if not valid:
             continue
@@ -691,23 +691,23 @@ def _attack_token_genetic(
     num_genes = len(identifiers)
     if num_genes == 0:
         if verbose:
-            print("[GA] 所有标识符均无合法候选")
+            print("[GA] No legal candidates for any identifier")
         return False, current_code_str
 
-    # 归一化重要性到 [0, 1]
+    # Normalize importance to [0, 1]
     max_imp = max(importances) if max(importances) > 0 else 1.0
     norm_importances = [imp / max_imp for imp in importances]
 
     if verbose:
-        print(f"[GA] guidance={guidance_mode}, 标识符数={num_genes}, "
-              f"种群={pop_size}, 最大代数={max_generations}")
+        print(f"[GA] guidance={guidance_mode}, identifiers={num_genes}, "
+              f"population={pop_size}, max_generations={max_generations}")
         top3 = [(identifiers[i], f"{importances[i]:.4f}") for i in range(min(3, num_genes))]
-        print(f"[GA] Top-3 标识符: {top3}")
+        print(f"[GA] Top-3 identifiers: {top3}")
 
     queries_used = 0
 
     def trace_replacements(chromosome):
-        """构造当前染色体中实际替换的 identifier 级 trace 信息。"""
+        """Construct identifier-level trace information for actual replacements in the current chromosome."""
         records = []
         for i, gene in enumerate(chromosome):
             if gene > 0 and gene <= len(candidates[i]):
@@ -722,27 +722,27 @@ def _attack_token_genetic(
         return records
 
     # ═══════════════════════════════════════════════════════════
-    # Step 2: 染色体操作辅助函数
+    # Step 2: Helper functions for chromosome operations
     # ═══════════════════════════════════════════════════════════
 
     def decode(chromosome):
-        """将染色体解码为 {old_name: new_name} 的替换字典。"""
+        """Decode a chromosome into a replacement dictionary {old_name: new_name}."""
         rename_dict = {}
         for i, gene in enumerate(chromosome):
             if gene > 0 and gene <= len(candidates[i]):
                 rename_dict[identifiers[i]] = candidates[i][gene - 1]
         return rename_dict
 
-    # 添加缓存，避免相同子代重新判断
+    # Add a cache to avoid reevaluating identical offspring
     fitness_cache = {}
 
     def evaluate(chromosome, generation=None, individual_index=None):
         """
-        评估一条染色体的适应度。
+        Evaluate the fitness of one chromosome.
 
         Returns:
             (margin, pred, true_conf, proposed_code_str)
-            margin 越小越好，< 0 表示翻转
+            smaller margin is better; < 0 indicates a flip
         """
         key = tuple(chromosome)
         if key in fitness_cache:
@@ -753,7 +753,7 @@ def _attack_token_genetic(
         if not rename_dict:
             return 999.0, true_label, 1.0, current_code_str
 
-        # 用 multi_renamed_pdg_to_embedding 快速评估
+        # Use multi_renamed_pdg_to_embedding for fast evaluation
         proposed_data = multi_renamed_pdg_to_embedding(
             current_pdg, wv, rename_dict, true_label
         ).to(DEVICE)
@@ -763,16 +763,16 @@ def _attack_token_genetic(
         )
         queries_used += 1
 
-        # 生成对应的源码（用于记录和返回）
+        # Generate the corresponding source code (for logging and return)
         proposed_code = _to_str(
             rename_identifiers(current_code_str,rename_dict)
         )
 
-        # 更新全局攻击状态
+        # Update the global attack state
         state.update(proposed_code, pred, true_conf, true_label)
 
-        # 记录每次实际模型查询对应的替换和解释分数，供后续脆弱空间分析。
-        # trace 默认关闭时不构造 replacements，避免正常批量攻击产生额外开销。
+        # Record replacements and explanation scores for each actual model query for later vulnerable-space analysis.
+        # When tracing is disabled by default, do not build replacements to avoid extra overhead in normal batch attacks.
         if getattr(trace_logger, 'enabled', False):
             trace_logger.log_query(
                 phase='token_ga',
@@ -795,33 +795,33 @@ def _attack_token_genetic(
 
     def init_chromosome():
         """
-        生成一条初始染色体。
-        高 importance 标识符有更大概率被初始化为替换状态。
+        Generate an initial chromosome.
+        High-importance identifiers are more likely to be initialized in a replaced state.
         """
         chromosome = [0] * num_genes
         for i in range(num_genes):
-            # 初始化替换概率 = 0.3 + 0.5 * normalized_importance
-            # importance=1.0 → 80% 概率被替换
-            # importance=0.0 → 30% 概率被替换
-            p_init = 0.3 + 0.5 * norm_importances[i]
+            # Initial replacement probability = 0.2 + 0.7 * normalized_importance
+            # importance=1.0 → 90% probability of being replaced
+            # importance=0.0 → 20% probability of being replaced
+            p_init = 0.2 + 0.7 * norm_importances[i]
             if rnd.random() < p_init:
                 chromosome[i] = rnd.randint(1, len(candidates[i]))
         return chromosome
 
     def mutate(chromosome):
         """
-        变异操作：importance 加权的变异概率。
+        Mutation operation: mutation probability weighted by importance.
         """
         result = list(chromosome)
         for i in range(num_genes):
-            # 变异概率 = base_rate * (1 + importance)
+            # Mutation probability = base_rate * (1 + importance)
             p_mut = base_mutation_rate * (1.0 + norm_importances[i])
             if rnd.random() < p_mut:
                 result[i] = rnd.randint(0, len(candidates[i]))
         return result
 
     def crossover(parent_a, parent_b):
-        """均匀交叉：每个基因位独立地从两个父代中选择。"""
+        """Uniform crossover: choose each gene independently from two parents."""
         child = [0] * num_genes
         for i in range(num_genes):
             if rnd.random() < 0.5:
@@ -831,16 +831,16 @@ def _attack_token_genetic(
         return child
 
     def tournament_select(population, fitnesses, k=3):
-        """锦标赛选择：随机抽 k 个，选最优。"""
+        """Tournament selection: randomly sample k individuals and choose the best."""
         indices = rnd.sample(range(len(population)), min(k, len(population)))
         best_idx = min(indices, key=lambda x: fitnesses[x])
         return population[best_idx]
 
     # ═══════════════════════════════════════════════════════════
-    # Step 3: GA 主循环
+    # Step 3: Main GA loop
     # ═══════════════════════════════════════════════════════════
 
-    # 初始化种群
+    # Initialize the population
     population = [init_chromosome() for _ in range(pop_size)]
 
     best_ever_margin = 999.0
@@ -851,7 +851,7 @@ def _attack_token_genetic(
         if queries_used >= max_queries:
             break
 
-        # ── 评估当代种群 ──
+        # ── Evaluate the current population ──
         fitnesses = []
         for idx, chrom in enumerate(population):
             if queries_used >= max_queries:
@@ -863,22 +863,22 @@ def _attack_token_genetic(
             )
             fitnesses.append(margin)
 
-            # 更新全局最优
+            # Update the global best
             if margin < best_ever_margin:
                 best_ever_margin = margin
                 best_ever_chromosome = list(chrom)
                 best_ever_code = proposed_code
 
-            # 攻击成功：立即返回
+            # Attack succeeds: return immediately
             if pred != true_label:
                 if verbose:
                     rename_dict = decode(chrom)
                     renames = ', '.join(f'{k}→{v}' for k, v in rename_dict.items())
-                    print(f"[GA] ✓ 代{gen} 个体{idx} 翻转成功！"
-                          f" margin={margin:.4f} 查询={queries_used}")
-                    print(f"[GA]   替换: {renames}")
+                    print(f"[GA] ✓ Generation {gen}, individual {idx} flipped successfully!"
+                          f" margin={margin:.4f} queries={queries_used}")
+                    print(f"[GA]   replacements: {renames}")
 
-                # 记录重命名到 rename_map
+                # Record renaming in rename_map
                 for old_n, new_n in decode(chrom).items():
                     rename_map.add(old_n, new_n)
 
@@ -887,24 +887,24 @@ def _attack_token_genetic(
         if queries_used >= max_queries:
             break
 
-        # ── 打印当代统计 ──
+        # ── Print current-generation statistics ──
         if verbose:
             gen_best = min(fitnesses)
             gen_avg = sum(f for f in fitnesses if f < 999) / max(1, sum(1 for f in fitnesses if f < 999))
             num_replacing = sum(1 for g in population[fitnesses.index(gen_best)] if g > 0)
-            print(f"[GA] 代{gen}: best_margin={gen_best:.4f} "
-                  f"avg={gen_avg:.4f} 替换数={num_replacing} "
-                  f"查询={queries_used}/{max_queries}")
+            print(f"[GA] Generation {gen}: best_margin={gen_best:.4f} "
+                  f"avg={gen_avg:.4f} replacements={num_replacing} "
+                  f"queries={queries_used}/{max_queries}")
 
-        # ── 构建下一代 ──
+        # ── Build the next generation ──
         new_population = []
 
-        # 精英保留
+        # Elite preservation
         sorted_indices = sorted(range(len(fitnesses)), key=lambda x: fitnesses[x])
         for i in range(min(elite_count, len(sorted_indices))):
             new_population.append(list(population[sorted_indices[i]]))
 
-        # 交叉 + 变异生成剩余个体
+        # Generate the remaining individuals via crossover + mutation
         while len(new_population) < pop_size:
             if rnd.random() < crossover_rate:
                 p1 = tournament_select(population, fitnesses)
@@ -918,13 +918,13 @@ def _attack_token_genetic(
 
         population = new_population
 
-        # ── 提前终止：连续 3 代最优 margin 未改善 ──
+        # ── Early stopping: best margin does not improve for 3 consecutive generations ──
         if gen >= 3:
-            # 简单的停滞检测
-            pass  # 可选：记录历史最优，连续无改善则 break
+            # Simple stagnation check
+            pass  # Optional: record historical best and break after consecutive non-improvements
 
     # ═══════════════════════════════════════════════════════════
-    # Step 4: GA 结束，返回最优个体对应的代码
+    # Step 4: GA ends; return the code corresponding to the best individual
     # ═══════════════════════════════════════════════════════════
 
     if best_ever_chromosome is not None:
@@ -934,20 +934,20 @@ def _attack_token_genetic(
 
         if verbose:
             num_replaced = sum(1 for g in best_ever_chromosome if g > 0)
-            print(f"[GA] ✗ 未翻转, best_margin={best_ever_margin:.4f} "
-                  f"替换数={num_replaced} 总查询={queries_used}")
+            print(f"[GA] ✗ Not flipped, best_margin={best_ever_margin:.4f} "
+                  f"replacements={num_replaced} total_queries={queries_used}")
 
     return False, best_ever_code
 
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 结果构建
+# Result construction
 # ══════════════════════════════════════════════════════════════════════
 
 def _build_attack_result(sample_id, true_label, original_code, state,
                          original_pred, original_true_conf, wrapper):
-    """从 AttackState 收集信息构建 AttackResult。"""
+    """Collect information from AttackState to build an AttackResult."""
     final_variant = state.final_variant or original_code
     best_variant = state.best_variant or original_code
     final_pred = state.final_pred if state.final_pred is not None else original_pred
@@ -978,7 +978,7 @@ def _build_attack_result(sample_id, true_label, original_code, state,
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 主入口
+# Main entry point
 # ══════════════════════════════════════════════════════════════════════
 
 def expl_atk(
@@ -992,51 +992,51 @@ def expl_atk(
     max_token_attempts=250,
     max_dependency_attempts=100,
     verbose=True,
-    # ── 消融开关（默认 "full"=token→reexplain→struct，对应论文主线）──
+    # ── Ablation switch (default "full" = token→reexplain→struct, matching the main paper pipeline) ──
     mode: str = DEFAULT_MODE,
     reexplain_fn=None,
-    # Adaptive Re-Explanation 开关
+    # Adaptive Re-Explanation switch
     adaptive_reexplain: bool = True,
-    # query-level attack trace 输出目录；None 时使用 attack_trace.py 的默认目录
+    # query-level attack trace output directory; None uses the default directory in attack_trace.py
     trace_dir=None,
 ):
     """
-    ExplAtk: 基于解释器引导的迭代式对抗攻击。
+    ExplAtk: explainer-guided iterative adversarial attack.
 
     Args:
-        sample_id:                样本 ID
-        original_code:            原始源码（str 或 bytes）
-        true_label:               真实标签
-        mapping:                  ExplanationMapping 对象（针对 original_code）
-        wrapper:                  ModelWrapper 实例
-        wv:                       gensim Word2Vec 词表
-        lang:                     语言标识（默认 'c'）
-        max_token_attempts:       Token 阶段最大尝试次数
-        max_dependency_attempts:  结构变换阶段最大尝试次数
-        verbose:                  是否打印过程
+        sample_id:                sample ID
+        original_code:            original source code (str or bytes)
+        true_label:               ground-truth label
+        mapping:                  ExplanationMapping object (for original_code)
+        wrapper:                  ModelWrapper instance
+        wv:                       gensim Word2Vec vocabulary
+        lang:                     language identifier (default: 'c')
+        max_token_attempts:       maximum number of token-stage attempts
+        max_dependency_attempts:  maximum number of structure-transformation-stage attempts
+        verbose:                  whether to print progress
 
-        mode: 消融模式，三选一：
-          - "token_only"  : Explain(v0) → Token        （只跑 token 阶段）
-          - "struct_only" : Explain(v0) → 结构变换       （只跑结构变换）
-          - "full"        : Explain(v0) → Token → Re-Explain(v1) → 结构变换
+        mode: ablation mode, one of three options:
+          - "token_only"  : Explain(v0) → Token        (run only the token stage)
+          - "struct_only" : Explain(v0) → structure transformation (run only structure transformation)
+          - "full"        : Explain(v0) → Token → Re-Explain(v1) → structure transformation
         reexplain_fn: callable(code_str) -> ExplanationMapping
-                      仅在 mode="full" 时被调用一次，将基于 token 阶段产出的
-                      变体重新生成 mapping。失败/未提供时沿用旧 mapping。
-        adaptive_reexplain: 当 mode="full" 时是否启用 Adaptive Re-Explanation。
-                            True：依据 conf_drop 自适应决定是否真正调用 reexplain_fn
-                                  （详见 _should_reexplain 与模块常量 DELTA_LOW/HIGH）；
-                            False：无条件 re-explain（用于消融对比）。
+                      called once only when mode="full"; regenerates the mapping for the
+                      variant produced by the token stage. Falls back to the old mapping if it fails or is not provided.
+        adaptive_reexplain: whether to enable Adaptive Re-Explanation when mode="full".
+                            True: adaptively decide whether to actually call reexplain_fn based on conf_drop
+                                  (see _should_reexplain and module-level constants DELTA_LOW/HIGH);
+                            False: always re-explain (for ablation comparison).
 
     Returns:
         AttackResult
     """
     assert mode in ("token_only", "struct_only", "full"), \
-        f"mode 必须是 'token_only' / 'struct_only' / 'full'，收到 {mode!r}"
+        f"mode must be 'token_only' / 'struct_only' / 'full', got {mode!r}"
 
     wrapper.reset_query_count()
     ori_code_str = original_code if isinstance(original_code, str) else original_code.decode('utf-8')
 
-    # ── 原始预测 ──
+    # ── Original prediction ──
     from common.utils.gen_embedding import src2embedding
     import torch
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1048,7 +1048,7 @@ def expl_atk(
 
     if original_pred != true_label:
         if verbose:
-            print(f"[ExplAtk] 样本 {sample_id}: 预测 {original_pred} ≠ 真实 {true_label}，跳过")
+            print(f"[ExplAtk] Sample {sample_id}: prediction {original_pred} != true label {true_label}; skipping")
         state = AttackState(original_true_conf)
         return _build_attack_result(
             sample_id, true_label, ori_code_str, state,
@@ -1074,15 +1074,15 @@ def expl_atk(
     run_reexplain = (mode == "full")
 
     if verbose:
-        print(f"[ExplAtk] 模式: {mode} (token={run_token}, "
+        print(f"[ExplAtk] mode: {mode} (token={run_token}, "
               f"reexplain={run_reexplain}, struct={run_struct})")
 
     # ════════════════════════════════════════════════════════════
-    # 阶段一：GA Token 级攻击
+    # Stage 1: GA token-level attack
     # ════════════════════════════════════════════════════════════
     if run_token:
         if verbose:
-            print(f"[ExplAtk] 阶段一：GA Token 攻击 (预算={max_token_attempts})")
+            print(f"[ExplAtk] Stage 1: GA token attack (budget={max_token_attempts})")
 
         success, current_code = _attack_token_genetic(
             current_code, current_mapping, wrapper, wv, true_label,
@@ -1098,7 +1098,7 @@ def expl_atk(
         if success:
             if verbose:
                 renames = ', '.join(f'{k}→{v}' for k, v in rename_map.mapping.items())
-                print(f"  ✓ Token 攻击成功！{renames}  查询: {wrapper.get_query_count()}")
+                print(f"  ✓ Token attack succeeded! {renames}  queries: {wrapper.get_query_count()}")
             trace_logger.close({
                 'stage': 'token',
                 'success': True,
@@ -1111,17 +1111,17 @@ def expl_atk(
             )
 
         if verbose:
-            print(f"  ✗ Token 未成功（查询: {wrapper.get_query_count()}）")
+            print(f"  ✗ Token attack did not succeed (queries: {wrapper.get_query_count()})")
 
-        # ── 回退到 token 阶段中置信度最低的变体 ──
+        # ── Fall back to the lowest-confidence variant from the token stage ──
         if (state.best_variant is not None
                 and state.best_true_conf < state.final_true_conf):
             current_code = state.best_variant
             if verbose:
-                print(f"  ↩ 回退到最优变体 (conf={state.best_true_conf:.4f}"
+                print(f"  ↩ Falling back to the best variant (conf={state.best_true_conf:.4f}"
                       f" < final={state.final_true_conf:.4f})")
 
-    # token_only 模式：到此结束
+    # token_only mode: stop here
     if not run_struct:
         trace_logger.close({
             'stage': 'token_only',
@@ -1135,49 +1135,49 @@ def expl_atk(
         )
 
     # ════════════════════════════════════════════════════════════
-    # 中间步骤：在 token 与 结构变换 之间做一次 re-explain
-    # 仅 mode="full" 触发；struct_only 直接跳过（沿用 v0 的 mapping）。
-    # 当 adaptive_reexplain=True 时，按 conf_drop 自适应决定是否实际执行。
+    # Intermediate step: run re-explain once between token and structure transformation
+    # Triggered only in mode="full"; struct_only skips it and keeps the v0 mapping.
+    # When adaptive_reexplain=True, use conf_drop to adaptively decide whether to run it.
     # ════════════════════════════════════════════════════════════
     if run_reexplain:
-        # —— Adaptive 早停判定 —————————————————————————————
+        # —— Adaptive early-stop decision —————————————————————————————
         skip_by_adaptive = False
         if adaptive_reexplain:
             do_re, reason = _should_reexplain(
                 state.original_true_conf, state.best_true_conf,
             )
             if verbose:
-                tag = "执行" if do_re else "跳过"
+                tag = "run" if do_re else "skip"
                 print(f"[ExplAtk] Adaptive Re-Explain → {tag}: {reason}")
             skip_by_adaptive = not do_re
 
         if skip_by_adaptive:
-            pass  # 不调用 reexplain_fn，沿用旧 mapping
+            pass  # Do not call reexplain_fn; keep the old mapping
         elif reexplain_fn is None:
             if verbose:
-                print("[ExplAtk] Re-Explain 跳过：未提供 reexplain_fn，沿用旧 mapping")
+                print("[ExplAtk] Re-Explain skipped: reexplain_fn is not provided; keeping the old mapping")
         else:
             if verbose:
-                print("[ExplAtk] Re-Explain：基于 token 阶段产出的变体重新解释")
+                print("[ExplAtk] Re-Explain: re-explaining the variant produced by the token stage")
             try:
                 new_mapping = reexplain_fn(current_code)
                 if new_mapping is not None:
                     current_mapping = new_mapping
                     if verbose:
-                        print(f"  ✓ 已刷新 mapping "
-                              f"(关键节点数={len(current_mapping.vulnerable_nodes)})")
+                        print(f"  ✓ Refreshed mapping "
+                              f"(key_nodes={len(current_mapping.vulnerable_nodes)})")
                 else:
                     if verbose:
-                        print("  ✗ reexplain_fn 返回 None，沿用旧 mapping")
+                        print("  ✗ reexplain_fn returned None; keeping the old mapping")
             except Exception as e:
                 if verbose:
-                    print(f"  ✗ Re-Explain 失败 ({e})，沿用旧 mapping")
+                    print(f"  ✗ Re-Explain failed ({e}); keeping the old mapping")
 
     # ════════════════════════════════════════════════════════════
-    # 阶段二：DDG/CDG 边引导的结构变换攻击
+    # Stage 2: structure transformation attack guided by DDG/CDG edges
     # ════════════════════════════════════════════════════════════
     if verbose:
-        print(f"[ExplAtk] 阶段二：结构变换攻击")
+        print(f"[ExplAtk] Stage 2: structure transformation attack")
 
     success, current_code = attack_structure_guided(
         current_code_str=current_code,
@@ -1193,8 +1193,8 @@ def expl_atk(
 
 
     if verbose:
-        status = "✓ 成功" if success else "✗ 失败"
-        print(f"  {status}  总查询: {wrapper.get_query_count()}")
+        status = "✓ Success" if success else "✗ Failed"
+        print(f"  {status}  total_queries: {wrapper.get_query_count()}")
 
     trace_logger.close({
         'stage': 'final',
@@ -1221,14 +1221,14 @@ def demo_atk(source_path):
 
     if result.success:
         print(f"\n{'─' * 60}")
-        print("首次成功变体:")
+        print("First successful variant:")
         print(f"{'─' * 60}")
         print(result.first_success_variant)
 
 
 def replace_path_part(path, old_part, new_part):
     """
-    只替换路径中的某一级目录名，避免误替换文件名中的字符串。
+    Replace only one directory component in a path to avoid accidentally replacing strings in the filename.
     """
     path = Path(path)
     parts = list(path.parts)
@@ -1236,7 +1236,7 @@ def replace_path_part(path, old_part, new_part):
     try:
         idx = parts.index(old_part)
     except ValueError:
-        raise ValueError(f"路径中没有目录 {old_part}: {path}")
+        raise ValueError(f"Directory component {old_part} not found in path: {path}")
 
     parts[idx] = new_part
     return Path(*parts)
@@ -1244,12 +1244,12 @@ def replace_path_part(path, old_part, new_part):
 
 def source_to_related_paths(source_path):
     """
-    根据 source_path 自动判断 normal / ori，并转换得到：
+    Automatically infer normal / ori from source_path and derive:
         dot_path
         cpg_bin_path
         json_path
 
-    规则：
+    Rules:
     1. normal:
         normal-src -> normal-pdg
         normal-src -> normal-cpg-bin
@@ -1260,11 +1260,11 @@ def source_to_related_paths(source_path):
         BigVul/all-src -> BigVul/ori-cpg-bin
         BigVul/all-src -> BigVul/ori-embedding
 
-        其他目录/src -> ori-pdg
-        其他目录/src -> ori-cpg-bin
-        其他目录/src -> ori-embedding
+        other directories/src -> ori-pdg
+        other directories/src -> ori-cpg-bin
+        other directories/src -> ori-embedding
 
-    3. 后缀：
+    3. Suffixes:
         .c -> .dot
         .c -> .bin
         .c -> .json
@@ -1273,7 +1273,7 @@ def source_to_related_paths(source_path):
     source_path = Path(source_path)
 
     if source_path.suffix != ".c":
-        raise ValueError(f"当前只支持 .c 文件，但收到: {source_path}")
+        raise ValueError(f"Only .c files are currently supported, got: {source_path}")
 
     parts = source_path.parts
 
@@ -1321,7 +1321,7 @@ def source_to_related_paths(source_path):
 
     else:
         raise ValueError(
-            f"无法根据路径自动判断类型，路径中应包含 normal-src、BigVul/all-src 或 src: {source_path}"
+            f"Cannot infer the path type automatically; the path should contain normal-src, BigVul/all-src, or src: {source_path}"
         )
 
     return str(dot_path), str(cpg_bin_path), str(json_path)
@@ -1339,7 +1339,7 @@ def run_expl_attack(
     lang='cpp',
     input_dim=100,
     output_dim=200,
-    # ── 消融开关：透传给 expl_atk ──
+    # ── Ablation switch: forwarded to expl_atk ──
     mode: str = DEFAULT_MODE,
     trace_dir=None,
 ):
@@ -1352,26 +1352,26 @@ def run_expl_attack(
 
     dot_path, cpg_bin_path, json_path =  source_to_related_paths(source_path)
     data = read_json(json_path)
-    pred_label = wrapper.predict_label(data)  # 通常为 1
+    pred_label = wrapper.predict_label(data)  # usually 1
     result = explainer.explain(data, pred_label)
 
-    # 2. 映射回源码（完整信息）
+    # 2. Map back to source code (full information)
     mapping = map_explanation_to_source(
         explain_result=result,
         dot_path=dot_path,
         cpg_bin_path=cpg_bin_path,
-        source_path=source_path,     # 可选
+        source_path=source_path,     # optional
     )
 
     mapping.print_summary()
 
-    # ── 构造 re-explain 闭包：仅 mode="full" 时被 expl_atk 调用一次 ──
-    # 闭包捕获 explainer / pred_label，对新代码就近重生成 dot+cpg-bin。
+    # ── Build the re-explain closure: called once by expl_atk only when mode="full" ──
+    # The closure captures explainer / pred_label and regenerates dot+cpg-bin locally for new code.
     def _reexplain_fn(code_str: str):
         """
-        对当前变体重新生成 PDG/CPG-bin，再跑一次 explainer，
-        返回新的 ExplanationMapping。任何中间环节失败都抛异常，
-        由 expl_atk 内部 try/except 兜底（沿用旧 mapping）。
+        Regenerate PDG/CPG-bin for the current variant, then run the explainer again,
+        and return a new ExplanationMapping. Any intermediate failure raises an exception,
+        which is handled by the try/except inside expl_atk by falling back to the old mapping.
         """
         import os, tempfile
         from common.utils.gen_embedding import (
@@ -1387,15 +1387,15 @@ def run_expl_attack(
             with open(tmp_src, "w", encoding="utf-8") as f:
                 f.write(code_str if isinstance(code_str, str) else code_str.decode("utf-8"))
 
-            # 生成 cpg-bin 与 dot
+            # Generate cpg-bin and dot
             joern_parse(tmp_src, tmp_bin)
             if not os.path.exists(tmp_bin):
-                raise RuntimeError("joern_parse 未产出 cpg-bin")
+                raise RuntimeError("joern_parse did not produce cpg-bin")
             joern_export(tmp_bin, tmp_pdg_dir)
             if not os.path.exists(tmp_dot):
-                raise RuntimeError("joern_export 未产出 dot")
+                raise RuntimeError("joern_export did not produce dot")
 
-            # 跑 explainer：基于变体代码的 embedding
+            # Run the explainer using an embedding based on the variant code
             new_data = src2embedding(
                 code_str.encode("utf-8") if isinstance(code_str, str) else code_str,
                 pred_label,
@@ -1406,7 +1406,7 @@ def run_expl_attack(
                 explain_result=new_result,
                 dot_path=tmp_dot,
                 cpg_bin_path=tmp_bin,
-                source_path=None,  # 用变体源码代替不再准确的原 source_path
+                source_path=None,  # Use variant source code instead of the original source_path, which is no longer accurate
             )
         return new_mapping
 

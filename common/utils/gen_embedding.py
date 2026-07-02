@@ -1,23 +1,29 @@
 """
-gen_embedding.py  ——  线程安全改造版
+gen_embedding.py -- thread-safe refactored version
 
-【对外接口完全不变】
-所有公开函数的签名、参数语义、返回值、副作用（产出文件位置等）都与原版一致，
-上游调用方零改动。
+Public interfaces are fully unchanged.
+All public function signatures, parameter semantics, return values, and side effects
+(such as output file locations) remain the same as in the original version, so
+upstream callers do not need any changes.
 
-【改造点】
+Refactoring points:
 1. load_word_vectors:
-   原版每次调用都 KeyedVectors.load,既慢又会在多线程下并发 mmap 同一份文件;
-   改为按 path 缓存的单例 + 双重检查锁,首次以外的调用只有一次 dict.get 开销。
+   The original version called KeyedVectors.load on every invocation, which was slow
+   and could concurrently mmap the same file in multiple threads. This version uses
+   a path-keyed singleton cache with double-checked locking; after the first load,
+   calls only incur one dict.get lookup.
 2. joern_parse / joern_export:
-   原版用 os.environ + os.system,os.environ 是进程级共享状态,在多线程下
-   会出现 A 设置的变量被 B 覆盖、最终 joern 处理错样本的严重 race condition;
-   改为 subprocess.run(["sh", "joern-...", arg1, arg2, ...], cwd=joern_path),
-   完全不动父进程 environ 与 CWD,线程之间互不影响。
+   The original version used os.environ and os.system. Since os.environ is shared at
+   the process level, concurrent threads could overwrite each other's variables and
+   cause Joern to process the wrong sample. This version uses subprocess.run(
+   ["sh", "joern-...", arg1, arg2, ...], cwd=joern_path), leaving the parent process
+   environment and CWD untouched so threads do not interfere with each other.
 3. src2embedding / src2pdg:
-   原版在主函数里 os.chdir(joern_path) 污染进程级 CWD;改造后 cwd 由 subprocess
-   单独管理,这里只剩 tempfile 隔离的纯 IO,完全线程安全。
-4. 后处理的 mv / rm -rf 改用 shutil,避免 shell 调用 + 处理路径中的特殊字符。
+   The original version called os.chdir(joern_path) in the main function, polluting
+   the process-level CWD. The refactored version lets subprocess manage cwd
+   separately; only tempfile-isolated pure IO remains here, so it is thread-safe.
+4. Post-processing mv / rm -rf operations now use shutil to avoid shell calls and
+   to handle special characters in paths safely.
 """
 
 import codecs
@@ -98,9 +104,10 @@ def tokenize_code_line(line):
 @lru_cache(maxsize=1)
 def load_word_vectors(path=None):
     """
-    线程安全 + 进程内单例缓存。
-    签名与原版一致;同一路径多次调用返回同一对象,避免重复 mmap 与 KeyedVectors 解析。
-    使用双重检查锁,稳态下的开销仅一次 dict.get。
+    Thread-safe in-process singleton cache.
+    The signature matches the original version. Multiple calls with the same path
+    return the same object, avoiding repeated mmap operations and KeyedVectors parsing.
+    Double-checked locking keeps steady-state overhead to a single dict.get lookup.
     """
     path = path or get_settings().word2vec_path
     kv = KeyedVectors.load(path, mmap="r")
@@ -108,10 +115,10 @@ def load_word_vectors(path=None):
 
 
 def read_json(filename):
-    #读取文件
+    # Read the file
     with open(filename.strip(),'r') as f:
         file = json.load(f)
-    #文件内容读取到torch.tensor()中
+    # Convert file contents into torch.tensor()
     x = torch.tensor(file['node_features'],dtype=torch.float32)
     num_nodes = x.shape[0]
     if num_nodes < 10:
@@ -140,10 +147,11 @@ def read_json(filename):
 
 def src2embedding(src, label):
     """
-    线程安全版:
-    - 不再 os.chdir(joern_path)(CWD 由 subprocess 在 joern_parse/export 内部处理)
-    - load_word_vectors 现在是缓存的,不会重复 load
-    输入输出与原版完全一致。
+    Thread-safe version:
+    - No longer calls os.chdir(joern_path); CWD is handled inside joern_parse/export
+      through subprocess.
+    - load_word_vectors is now cached and will not load repeatedly.
+    Inputs and outputs are fully consistent with the original version.
     """
     if isinstance(src, bytes):
         src = src.decode('utf-8')
@@ -168,11 +176,11 @@ def src2embedding(src, label):
 
 # def joern_parse(src, bin):
 #     """
-#     线程安全版:
-#     - 不再修改 os.environ
-#     - 不依赖父进程 CWD,通过 subprocess 的 cwd 参数在子进程独立设置
-#     - argv 直接传值,避免 shell 解释带来的路径转义问题
-#     签名与原版一致。
+#     Thread-safe version:
+#     - No longer modifies os.environ
+#     - Does not rely on the parent-process CWD; subprocess cwd sets it independently in the child process
+#     - Passes argv directly to avoid path-escaping issues caused by shell interpretation
+#     The signature matches the original version.
 #     """
 #     subprocess.run(
 #         ["sh", "joern-parse", str(src), "--language", "c", "--out", str(bin)],
@@ -183,13 +191,13 @@ def src2embedding(src, label):
 
 def joern_parse(src, bin):
     joern_path = get_settings().joern_path
-    # 用独立 workspace 隔离并发,工作目录用 temp dir,joern 脚本用绝对路径
+    # Use an independent workspace to isolate concurrent runs; use a temp dir as the working directory and absolute paths for Joern scripts
     with tempfile.TemporaryDirectory(prefix="joern_ws_") as ws:
         try:
             subprocess.run(
                 ["sh", os.path.join(joern_path, "joern-parse"),
                  str(src), "--language", "c", "--out", str(bin)],
-                cwd=ws,                              # workspace 隔离在这
+                cwd=ws,                              # workspace isolation happens here
                 stderr=subprocess.DEVNULL,
                 timeout=120,
                 check=False,
@@ -212,7 +220,7 @@ def joern_export(bin, pdg_dir):
             )
         except subprocess.TimeoutExpired:
             pass
-    # 后处理(与 ws 无关,操作的是调用方传入的 pdg_dir)
+    # Post-processing is independent of ws and operates on the caller-provided pdg_dir
     try:
         pdg_list = os.listdir(pdg_dir)
         for pdg in pdg_list:
@@ -228,8 +236,8 @@ def joern_export(bin, pdg_dir):
 
 # def joern_export(bin, pdg_dir):
 #     """
-#     线程安全版,改动同 joern_parse。
-#     后处理的 mv/rm 也换成 shutil。
+#     Thread-safe version, with the same changes as joern_parse.
+#     Post-processing mv/rm operations are also replaced with shutil.
 #     """
 #     subprocess.run(
 #         ["sh", "joern-export", str(bin), "--repr", "pdg", "--out", str(pdg_dir)],
@@ -256,7 +264,7 @@ def pdgfile2embedding(dot_pdg, word_vectors, true_label):
         with open(dot_pdg, 'r', encoding='utf-8') as f:
             content = f.read()
         try:
-            # 重写
+            # Rewrite
             parser = LooseDotParser()
             pdg = parser.to_networkx(content)
         except Exception as e:
@@ -326,7 +334,7 @@ def pdgfile2embedding(dot_pdg, word_vectors, true_label):
 
 def src2pdg(src):
     """
-    线程安全版:删掉 os.chdir,其余逻辑不变。
+    Thread-safe version: removes os.chdir while keeping the remaining logic unchanged.
     """
     if isinstance(src, bytes):
         src = src.decode('utf-8')
@@ -345,7 +353,7 @@ def src2pdg(src):
         with open(pdg_file, 'r', encoding='utf-8') as f:
             content = f.read()
         try:
-            # 重写
+            # Rewrite
             parser = LooseDotParser()
             pdg = parser.to_networkx(content)
         except Exception as e:

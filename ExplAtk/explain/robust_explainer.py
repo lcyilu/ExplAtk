@@ -1,25 +1,29 @@
 """
-Robust Explainer: 鲁棒因果推理解释器（基于 Coca 增强）
-================================================
-在 Coca (ICSE'24) 双视角因果推理基础上，引入对抗鲁棒训练：
-通过 min-max 优化，让生成的解释掩码对节点特征上的最坏扰动 δ 也保持稳定。
+Robust Explainer: robust causal-inference explainer (Coca-enhanced)
+====================================================================
+Based on Coca (ICSE'24) dual-view causal inference, this module adds adversarially robust training:
+min-max optimization keeps the generated explanation mask stable even under worst-case perturbations
+delta on node features.
 
-核心思想（与 Coca 对比）：
-  - Coca 只优化 mask 让事实/反事实预测达标（min over mask）
-  - Robust 在每个外层 mask 更新前，先内层求一个最坏特征扰动 δ*（max over δ）
-    使被解释样本在该扰动下尽可能"翻车"，再让 mask 在 (x + δ*) 上仍能维持解释
-  → 得到的解释对训练分布外的微小漂移更稳定，与攻击器结合时更难被绕过
+Core idea (compared with Coca):
+  - Coca optimizes only the mask so that factual/counterfactual predictions satisfy the objective
+    (min over mask).
+  - Before each outer mask update, Robust first solves for a worst-case feature perturbation delta*
+    in the inner loop (max over delta), making the explained sample fail as much as possible under
+    that perturbation; then it makes the mask preserve the explanation on (x + delta*).
+  -> The resulting explanations are more stable under small out-of-distribution shifts and are
+     harder for the attacker to bypass.
 
-数学形式:
+Mathematical form:
     min_{m_v, m_e}  L_coca(x, m_v, m_e)
-                  + λ_adv * max_{‖δ‖∞ ≤ ε}  L_coca(x + δ, m_v, m_e)
-                  + 正则项
+                  + lambda_adv * max_{||delta||_inf <= eps}  L_coca(x + delta, m_v, m_e)
+                  + regularization terms
 
-适配说明:
-  - 与 CocaExplainer 接口完全兼容（同样的 explain(data, label) 调用）
-  - δ 只扰动节点特征 x，不扰动图结构 edge_index
-  - 内层 PGD 共享同一个 mask 进行 K 步上升，外层 Adam 下降
-  - 提供 adv_warmup 让前若干 epoch 仅做 Coca 训练，避免冷启动震荡
+Compatibility notes:
+  - Fully compatible with the CocaExplainer interface (same explain(data, label) call).
+  - delta perturbs only node features x, not the graph structure edge_index.
+  - The inner PGD loop shares the same mask for K ascent steps, while the outer loop uses Adam descent.
+  - adv_warmup runs Coca-only training for the first few epochs to avoid cold-start instability.
 """
 
 import torch
@@ -31,17 +35,18 @@ from explain.coca_explainer import CocaExplainer
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 核心类：Robust Explainer
+# Core class: Robust Explainer
 # ══════════════════════════════════════════════════════════════════════
 
 class RobustExplainer(CocaExplainer):
     """
-    Coca + PGD 对抗鲁棒训练的解释器。
+    Explainer with Coca + PGD adversarial robust training.
 
-    继承自 CocaExplainer，复用其 _masked_forward / _continuity_regularization
-    / _empty_result 等基础设施，只重写 explain() 主循环以加入内层 PGD。
+    Inherits from CocaExplainer and reuses infrastructure such as _masked_forward,
+    _continuity_regularization, and _empty_result. Only the main explain() loop is
+    overridden to add the inner PGD loop.
 
-    用法:
+    Usage:
         explainer = RobustExplainer(model, device='cuda',
                                     eps=0.05, pgd_steps=5, adv_loss_weight=1.0)
         result = explainer.explain(data, predicted_label=1)
@@ -57,12 +62,12 @@ class RobustExplainer(CocaExplainer):
         sparsity_coeff_feat=0.01,
         sparsity_coeff_edge=0.005,
         top_k=5,
-        # ── 对抗训练相关超参 ──
-        eps=0.05,                # PGD 扰动半径（L∞），相对节点特征量级
-        pgd_steps=5,             # 内层 PGD 上升步数
-        pgd_step_size=None,      # 单步步长，None → 自动设为 eps / pgd_steps * 2.5
-        adv_loss_weight=1.0,     # 外层对抗损失权重 λ_adv
-        adv_warmup=50,           # 前多少 epoch 不启用对抗训练（先稳定 mask）
+        # ── Adversarial training hyperparameters ──
+        eps=0.05,                # PGD perturbation radius (L-infinity), relative to node-feature scale
+        pgd_steps=5,             # Number of inner PGD ascent steps
+        pgd_step_size=None,      # Step size; None -> automatically set to eps / pgd_steps * 2.5
+        adv_loss_weight=1.0,     # Outer adversarial loss weight lambda_adv
+        adv_warmup=50,           # Number of initial epochs without adversarial training (stabilizes the mask first)
     ):
         super().__init__(
             model=model,
@@ -84,15 +89,16 @@ class RobustExplainer(CocaExplainer):
         self.adv_warmup = adv_warmup
 
     # ─────────────────────────────────────────────────────────
-    # 主入口（重写）
+    # Main entry point (overridden)
     # ─────────────────────────────────────────────────────────
 
     def explain(self, data, predicted_label):
         """
-        生成单样本的鲁棒解释。
+        Generate a robust explanation for a single sample.
 
-        与父类签名/返回完全一致；额外在 result 中带回 'adv_loss_history'，
-        便于诊断对抗损失是否收敛。
+        The signature and return format are fully consistent with the parent class.
+        The result additionally includes 'adv_loss_history' for diagnosing whether
+        the adversarial loss converges.
         """
         x = data.x.to(self.device)
         edge_index = data.edge_index.to(self.device)
@@ -107,7 +113,7 @@ class RobustExplainer(CocaExplainer):
         y_hat = predicted_label
         y_hat_s = 1 - y_hat
 
-        # ── 初始化掩码 ───────────────────────────────────
+        # ── Initialize masks ───────────────────────────────────
         feat_mask = (3.0 * torch.ones(num_nodes, device=self.device)
                     + 0.1 * torch.randn(num_nodes, device=self.device))
         feat_mask.requires_grad = True
@@ -118,7 +124,7 @@ class RobustExplainer(CocaExplainer):
 
         optimizer = torch.optim.Adam([feat_mask, edge_mask], lr=self.lr)
 
-        # ── 优化循环 ─────────────────────────────────────
+        # ── Optimization loop ─────────────────────────────────────
         loss_history = []
         adv_loss_history = []
         best_loss = float('inf')
@@ -132,20 +138,20 @@ class RobustExplainer(CocaExplainer):
                 sigmoid_feat = torch.sigmoid(feat_mask)
                 sigmoid_edge = torch.sigmoid(edge_mask)
 
-                # ── (a) 干净视图下的 Coca 损失 ──
+                # ── (a) Coca loss under the clean view ──
                 clean_loss, _ = self._coca_objective(
                     x, edge_index, sigmoid_feat, sigmoid_edge,
                     y_hat, y_hat_s,
                 )
 
-                # ── (b) 内层 PGD 求最坏扰动 δ* ──
+                # ── (b) Inner PGD solves for the worst-case perturbation delta* ──
                 if epoch >= self.adv_warmup and self.adv_loss_weight > 0:
                     delta_star = self._inner_pgd(
                         x, edge_index,
                         sigmoid_feat.detach(), sigmoid_edge.detach(),
                         y_hat, y_hat_s,
                     )
-                    # 在 (x + δ*) 上重算对抗损失（mask 保持可微）
+                    # Recompute adversarial loss on (x + delta*) while keeping the mask differentiable
                     adv_loss, _ = self._coca_objective(
                         x + delta_star, edge_index,
                         sigmoid_feat, sigmoid_edge,
@@ -154,7 +160,7 @@ class RobustExplainer(CocaExplainer):
                 else:
                     adv_loss = torch.tensor(0.0, device=self.device)
 
-                # ── (c) 稀疏 + 连续性正则 ──
+                # ── (c) Sparsity + continuity regularization ──
                 sparsity_loss = (
                     self.sparsity_coeff_feat * sigmoid_feat.sum()
                     + self.sparsity_coeff_edge * sigmoid_edge.sum()
@@ -163,7 +169,7 @@ class RobustExplainer(CocaExplainer):
                     sigmoid_feat, edge_index
                 )
 
-                # ── (d) 总损失 ──
+                # ── (d) Total loss ──
                 loss = (
                     clean_loss
                     + self.adv_loss_weight * adv_loss
@@ -185,7 +191,7 @@ class RobustExplainer(CocaExplainer):
                     best_feat_mask = feat_mask.detach().clone()
                     best_edge_mask = edge_mask.detach().clone()
 
-        # ── 后处理 ───────────────────────────────────────
+        # ── Post-processing ───────────────────────────────────────
         node_importance = torch.sigmoid(best_feat_mask).cpu().numpy()
         edge_importance = torch.sigmoid(best_edge_mask).cpu().numpy()
 
@@ -207,17 +213,18 @@ class RobustExplainer(CocaExplainer):
         }
 
     # ─────────────────────────────────────────────────────────
-    # Coca 损失（事实 + 反事实，供干净/对抗两路共用）
+    # Coca loss (factual + counterfactual, shared by clean and adversarial branches)
     # ─────────────────────────────────────────────────────────
 
     def _coca_objective(self, x, edge_index, sigmoid_feat, sigmoid_edge,
                         y_hat, y_hat_s):
         """
-        计算单一视图（干净或被扰动）下的 Coca 对比损失 L_f + L_c。
+        Compute the Coca contrastive loss L_f + L_c for a single view
+        (clean or perturbed).
 
-        返回:
-            total: 标量 tensor，  α·L_f + (1−α)·L_c
-            (probs_fact, probs_cf): 备用诊断
+        Returns:
+            total: scalar tensor, alpha * L_f + (1 - alpha) * L_c
+            (probs_fact, probs_cf): optional diagnostics
         """
         probs_fact = self._masked_forward(
             x, edge_index, sigmoid_feat, sigmoid_edge, mode='factual'
@@ -236,26 +243,27 @@ class RobustExplainer(CocaExplainer):
         return total, (probs_fact, probs_cf)
 
     # ─────────────────────────────────────────────────────────
-    # 内层：PGD 求最坏特征扰动 δ*
+    # Inner loop: PGD solves for the worst-case feature perturbation delta*
     # ─────────────────────────────────────────────────────────
 
     def _inner_pgd(self, x, edge_index, sigmoid_feat, sigmoid_edge,
                    y_hat, y_hat_s):
         """
-        给定当前 mask，沿 Coca 损失上升方向找半径 ε 内最坏的 δ。
+        Given the current mask, find the worst-case delta within radius eps
+        along the ascent direction of the Coca loss.
 
-        说明:
-            - δ 只加在节点特征上，不改 edge_index
-            - mask 在内层视为常量（已 detach）
-            - 上升目标：让 mask 看到 (x+δ) 后 Coca 损失变大，
-                       即解释在该扰动下"失效"
-            - 用 sign-gradient + L∞ 投影（标准 PGD-L∞）
+        Notes:
+            - delta is added only to node features and does not modify edge_index.
+            - The mask is treated as a constant in the inner loop (already detached).
+            - The ascent objective is to increase the Coca loss after the mask sees
+              (x + delta), meaning the explanation fails under this perturbation.
+            - Uses sign-gradient updates plus L-infinity projection (standard PGD-L-infinity).
 
-        返回:
-            delta: (num_nodes, feat_dim) 张量，已 detach
+        Returns:
+            delta: detached tensor with shape (num_nodes, feat_dim)
         """
         delta = torch.zeros_like(x, requires_grad=True)
-        # 随机初始化（在 ε 球内均匀采样），有助于跳出鞍点
+        # Random initialization (uniformly sampled within the eps ball) helps escape saddle points
         with torch.no_grad():
             delta.add_(torch.empty_like(x).uniform_(-self.eps, self.eps))
 
@@ -271,22 +279,24 @@ class RobustExplainer(CocaExplainer):
             )[0]
 
             with torch.no_grad():
-                # 上升一步
+                # Take one ascent step
                 delta = delta + self.pgd_step_size * grad.sign()
-                # L∞ 投影到 ε 球
+                # Project onto the L-infinity eps ball
                 delta = torch.clamp(delta, min=-self.eps, max=self.eps)
 
         return delta.detach()
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 批量解释器：与 BatchCocaExplainer 同接口
+# Batch explainer: same interface as BatchCocaExplainer
 # ══════════════════════════════════════════════════════════════════════
 
 class BatchRobustExplainer:
     """
-    批量运行 RobustExplainer，对数据集中所有被正确检测为 vulnerable 的样本生成解释。
-    接口与 BatchCocaExplainer 一致，可直接替换。
+    Run RobustExplainer in batch mode and generate explanations for all samples
+    in the dataset that are correctly detected as vulnerable.
+
+    The interface is consistent with BatchCocaExplainer and can be used as a direct replacement.
     """
 
     def __init__(self, model, device="cuda" if torch.cuda.is_available() else "cpu",
@@ -314,18 +324,18 @@ class BatchRobustExplainer:
                 results.append(result)
 
                 if len(results) % 50 == 0:
-                    print(f"[Robust_Exp] 已解释 {len(results)} 个样本...")
+                    print(f"[Robust_Exp] Explained {len(results)} samples...")
 
             except Exception as e:
-                print(f"[Robust_Exp] 样本 {idx} 解释失败: {e}")
+                print(f"[Robust_Exp] Failed to explain sample {idx}: {e}")
                 continue
 
-        print(f"[Robust_Exp] 完成，共解释 {len(results)} 个样本。")
+        print(f"[Robust_Exp] Done. Explained {len(results)} samples in total.")
         return results
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 使用示例
+# Usage example
 # ══════════════════════════════════════════════════════════════════════
 
 def demo_explain_robust():
@@ -345,7 +355,7 @@ def demo_explain_robust():
         lr=0.01,
         epochs=300,
         top_k=5,
-        # ── 对抗训练超参 ──
+        # ── Adversarial training hyperparameters ──
         eps=0.05,
         pgd_steps=5,
         adv_loss_weight=1.0,
@@ -358,12 +368,12 @@ def demo_explain_robust():
         'bbc2d8918fe234b7ef2c480eb148943922cc0959_1.json'
     )
     pred_label = wrapper.predict_label(data)
-    print(f"原始样本预测标签: {pred_label}")
+    print(f"Original sample predicted label: {pred_label}")
 
     result = explainer.explain(data, pred_label)
-    print("top-k 关键节点: " + str(result['top_nodes']))
-    print(f"对抗损失收敛: 首={result['adv_loss_history'][0]:.4f}, "
-          f"末={result['adv_loss_history'][-1]:.4f}")
+    print("top-k key nodes: " + str(result['top_nodes']))
+    print(f"Adversarial loss convergence: first={result['adv_loss_history'][0]:.4f}, "
+          f"last={result['adv_loss_history'][-1]:.4f}")
 
 
 if __name__ == '__main__':

@@ -1,15 +1,15 @@
 """
-解释结果到源码的映射（基于 Joern CPG-bin）
+Mapping explanation results back to source code (based on Joern CPG-bin)
 =============================================
 
-数据来源：
-  1. cpg-bin 文件 → 通过 Joern 导出所有节点 JSON（含 lineNumber, code 等）
-  2. PDG dot 文件 → 节点遍历顺序（与 pdg2embedding 一致）+ 边类型（DDG/CDG）
-  3. CocaExplainer 输出 → node_importance, edge_importance
+Data sources:
+  1. cpg-bin file -> export all node JSON through Joern (including lineNumber, code, etc.)
+  2. PDG dot file -> node traversal order (consistent with pdg2embedding) + edge types (DDG/CDG)
+  3. CocaExplainer output -> node_importance, edge_importance
 
-输出：
-  丰富的攻击目标信息，同时包含关键节点和关键边，
-  区分边类型（DDG/CDG），支持不同的攻击策略。
+Output:
+  Rich attack-target information, including both key nodes and key edges,
+  with edge types (DDG/CDG) distinguished to support different attack strategies.
 """
 
 import json
@@ -30,20 +30,20 @@ def export_nodes_from_cpg_bin(
     timeout=120,
 ):
     """
-    调用 Joern 从 cpg-bin 文件导出所有节点信息，返回 Python 列表。
+    Call Joern to export all node information from a cpg-bin file and return a Python list.
 
-    写入临时 JSON 文件 → 读取为 Python 对象 → 删除临时文件。
+    Write to a temporary JSON file -> read it as a Python object -> delete the temporary file.
 
     Args:
-        cpg_bin_path:   .bin 文件路径
-        joern_path:     Joern 安装目录
-        save_json_path: 可选，若提供则保存一份到该路径（方便后续复用，不再调 Joern）
-        timeout:        Joern 执行超时秒数
+        cpg_bin_path:   .bin file path
+        joern_path:     Joern installation directory
+        save_json_path: optional; if provided, save a copy to this path for later reuse without calling Joern again
+        timeout:        Joern execution timeout in seconds
 
     Returns:
-        list[dict]: 解析后的节点列表
+        list[dict]: parsed node list
     """
-    # 临时文件路径
+    # Temporary file path
     tmp_json = os.path.join(tempfile.gettempdir(), f'joern_cpg_{os.getpid()}.json')
 
     original_dir = os.getcwd()
@@ -65,20 +65,20 @@ def export_nodes_from_cpg_bin(
         stdout, stderr = proc.communicate(cmd, timeout=timeout)
 
         if not os.path.exists(tmp_json):
-            print(f"[错误] Joern 未生成输出文件")
+            print(f"[Error] Joern did not generate an output file")
             print(f"  stdout: {stdout[:500]}")
             print(f"  stderr: {stderr[:500]}")
             return []
 
-        # 读取临时文件
+        # Read the temporary file
         with open(tmp_json, 'r', encoding='utf-8') as f:
             nodes = json.load(f)
 
         if not isinstance(nodes, list):
-            print(f"[错误] JSON 内容不是列表")
+            print(f"[Error] JSON content is not a list")
             return []
 
-        # 可选：保存一份供后续复用
+        # Optional: save a copy for later reuse
         if save_json_path:
             os.makedirs(os.path.dirname(save_json_path) or '.', exist_ok=True)
             with open(save_json_path, 'w', encoding='utf-8') as f:
@@ -88,14 +88,14 @@ def export_nodes_from_cpg_bin(
 
     except subprocess.TimeoutExpired:
         proc.kill()
-        print(f"[错误] Joern 执行超时（{timeout}s）")
+        print(f"[Error] Joern execution timed out ({timeout}s)")
         return []
     except Exception as e:
-        print(f"[错误] 导出失败: {e}")
+        print(f"[Error] Export failed: {e}")
         return []
     finally:
         os.chdir(original_dir)
-        # 清理临时文件
+        # Clean up the temporary file
         if os.path.exists(tmp_json):
             try:
                 os.unlink(tmp_json)
@@ -104,18 +104,18 @@ def export_nodes_from_cpg_bin(
 
 
 def load_cpg_nodes_json(json_path):
-    """加载已存在的 Joern 导出 JSON 文件。"""
+    """Load an existing JSON file exported by Joern."""
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
             nodes = json.load(f)
         return nodes if isinstance(nodes, list) else []
     except Exception as e:
-        print(f"[错误] 加载 JSON 失败: {e}")
+        print(f"[Error] Failed to load JSON: {e}")
         return []
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 核心映射函数
+# Core mapping function
 # ══════════════════════════════════════════════════════════════════════
 
 def map_explanation_to_source(
@@ -129,48 +129,48 @@ def map_explanation_to_source(
     threshold=None,
 ) :
     """
-    将解释器输出映射回源码，提供节点和边的完整攻击信息。
+    Map explainer output back to source code and provide complete attack information for nodes and edges.
 
-    cpg_json_path 和 cpg_bin_path 二选一：
-      - 如果 cpg_json_path 已存在，直接读取
-      - 否则从 cpg_bin_path 调用 Joern 导出
+    Choose either cpg_json_path or cpg_bin_path:
+      - If cpg_json_path already exists, read it directly
+      - Otherwise, call Joern to export from cpg_bin_path
 
     Args:
-        explain_result:  CocaExplainer.explain() 的返回值
-        dot_path:        PDG dot 文件路径
-        cpg_bin_path:    Joern cpg-bin 文件路径（与 cpg_json_path 二选一）
-        cpg_json_path:   已导出的 cpg.all JSON 路径（与 cpg_bin_path 二选一）
-        source_path:     原始 C 源码文件路径（用于读取完整源码行）
-        joern_path:      Joern 安装目录
-        top_k:           返回前 k 个关键节点/边
-        threshold:       可选，按重要性阈值过滤（优先于 top_k）
+        explain_result:  return value of CocaExplainer.explain()
+        dot_path:        PDG dot file path
+        cpg_bin_path:    Joern cpg-bin file path (choose either this or cpg_json_path)
+        cpg_json_path:   exported cpg.all JSON path (choose either this or cpg_bin_path)
+        source_path:     original C source file path (used to read complete source lines)
+        joern_path:      Joern installation directory
+        top_k:           return the top-k key nodes/edges
+        threshold:       optional; filter by importance threshold (takes precedence over top_k)
 
     Returns:
-        ExplanationMapping 对象（见下方类定义）
+        ExplanationMapping object (see the class definition below)
     """
     node_importance = explain_result['node_importance']
     edge_importance = explain_result['edge_importance']
     num_nodes = len(node_importance)
     num_edges = len(edge_importance)
 
-    # ── Step 0: 读取源码文件 ──────────────────────────────────
+    # ── Step 0: Read the source file ──────────────────────────────────
     source_lines = {}
     if source_path and os.path.exists(source_path):
         source_lines = _read_source_file(source_path)
 
-    # ── Step 1: 获取 CPG 节点信息 ─────────────────────────────
+    # ── Step 1: Get CPG node information ─────────────────────────────
     if cpg_json_path and os.path.exists(cpg_json_path):
         cpg_nodes = load_cpg_nodes_json(cpg_json_path)
     elif cpg_bin_path:
         cpg_nodes = export_nodes_from_cpg_bin(
             cpg_bin_path,
             joern_path=joern_path,
-            save_json_path=cpg_json_path,  # 可选：顺便保存一份供复用
+            save_json_path=cpg_json_path,  # Optional: also save a copy for reuse
         )
     else:
-        raise ValueError("必须提供 cpg_bin_path 或 cpg_json_path 之一")
+        raise ValueError("Either cpg_bin_path or cpg_json_path must be provided")
 
-    # 构建 CPG节点ID → 节点详情 的映射
+    # Build the mapping from CPG node ID -> node details
     cpg_id2info = {}
     for node in cpg_nodes:
         nid = node.get('id')
@@ -178,22 +178,22 @@ def map_explanation_to_source(
             cpg_id2info[str(nid)] = {
                 'lineNumber': node.get('lineNumber'),
                 'code': node.get('code', ''),
-                'label': node.get('_label', ''),       # AST节点类型
+                'label': node.get('_label', ''),       # AST node type
                 'name': node.get('name', ''),
                 'typeFullName': node.get('typeFullName', ''),
                 'order': node.get('order'),
             }
 
-    # ── Step 2: 解析 dot 文件，建立遍历顺序和边信息 ───────────
+    # ── Step 2: Parse the dot file and build traversal order and edge information ───────────
     pdg = _load_dot_file(dot_path)
     if pdg is None:
         return ExplanationMapping.empty(num_nodes, num_edges)
 
     dot_nodes = list(pdg.nodes())
     if len(dot_nodes) != num_nodes:
-        print(f"[警告] 节点数不一致: dot={len(dot_nodes)}, 图嵌入={num_nodes}")
+        print(f"[Warning] Node count mismatch: dot={len(dot_nodes)}, graph_embedding={num_nodes}")
 
-    # ── Step 3: 构建 图嵌入索引 → 源码信息 ────────────────────
+    # ── Step 3: Build graph embedding index -> source information ────────────────────
     index2info = {}
     for index, dot_node in enumerate(dot_nodes):
         if index >= num_nodes:
@@ -202,7 +202,7 @@ def map_explanation_to_source(
         dot_node_id = str(dot_node)
         cpg_info = cpg_id2info.get(dot_node_id, {})
 
-        # 从 dot label 中提取代码作为备选
+        # Extract code from the dot label as a fallback
         dot_label = pdg.nodes[dot_node].get('label', '')
         dot_code = _extract_code_from_dot_label(dot_label)
 
@@ -215,7 +215,7 @@ def map_explanation_to_source(
             'dot_node_id': dot_node_id,
         }
 
-    # ── Step 4: 构建边信息（保留类型）──────────────────────────
+    # ── Step 4: Build edge information (preserve types)──────────────────────────
     edge_details = []
     for item in pdg.adj.items():
         s = item[0]
@@ -235,8 +235,8 @@ def map_explanation_to_source(
                     ))
                     cdg_added = True
 
-    # ── Step 5: 按行号聚合节点重要性 ──────────────────────────
-    line2nodes = {}  # line_no → 聚合信息
+    # ── Step 5: Aggregate node importance by line number ──────────────────────────
+    line2nodes = {}  # line_no -> aggregated information
     for idx in range(num_nodes):
         info = index2info.get(idx, {})
         line_no = info.get('line_no')
@@ -245,7 +245,7 @@ def map_explanation_to_source(
         line_no = int(line_no)
         score = float(node_importance[idx])
 
-        # 代码优先级：源码文件 > CPG节点code > dot label
+        # Code priority: source file > CPG node code > dot label
         code = source_lines.get(line_no) or info.get('code', '')
 
         if line_no not in line2nodes:
@@ -263,8 +263,8 @@ def map_explanation_to_source(
             if score > line2nodes[line_no]['importance']:
                 line2nodes[line_no]['importance'] = score
 
-    # ── Step 6: 给边打分并附加源码信息 ────────────────────────
-    # 用源码文件的内容覆盖边端点的代码（如果有源码文件）
+    # ── Step 6: Score edges and attach source information ────────────────────────
+    # Override endpoint code with content from the source file if available
     scored_edges = []
     for i, ed in enumerate(edge_details):
         if i < num_edges:
@@ -272,7 +272,7 @@ def map_explanation_to_source(
         else:
             ed['importance'] = 0.0
 
-        # 源码文件覆盖
+        # Source-file override
         if source_lines:
             if ed.get('src_line') and ed['src_line'] in source_lines:
                 ed['src_code'] = source_lines[ed['src_line']]
@@ -281,7 +281,7 @@ def map_explanation_to_source(
 
         scored_edges.append(ed)
 
-    # ── Step 7: 筛选 top-k ────────────────────────────────────
+    # ── Step 7: Select top-k ────────────────────────────────────
     if threshold is not None:
         top_lines = [v for v in line2nodes.values() if v['importance'] > threshold]
         top_edges = [e for e in scored_edges if e['importance'] > threshold]
@@ -289,7 +289,7 @@ def map_explanation_to_source(
         top_lines = sorted(line2nodes.values(), key=lambda x: x['importance'], reverse=True)[:top_k]
         top_edges = sorted(scored_edges, key=lambda x: x['importance'], reverse=True)[:top_k]
 
-    # ── Step 8: 统计 ──────────────────────────────────────────
+    # ── Step 8: Statistics ──────────────────────────────────────────
     num_mapped = sum(1 for v in index2info.values() if v.get('line_no') is not None)
 
     return ExplanationMapping(
@@ -304,11 +304,11 @@ def map_explanation_to_source(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 映射结果封装
+# Mapping-result wrapper
 # ══════════════════════════════════════════════════════════════════════
 
 class ExplanationMapping:
-    """封装映射结果，提供多种视角的访问接口。"""
+    """Wrap mapping results and provide accessors from multiple perspectives."""
 
     def __init__(self, vulnerable_nodes, vulnerable_edges, all_lines,
                  all_edges, index2info, num_mapped, num_total):
@@ -325,13 +325,13 @@ class ExplanationMapping:
         return cls([], [], {}, [], {}, 0, num_nodes)
 
     # ─────────────────────────────────────────────────────────
-    # 攻击目标获取接口
+    # Attack target accessors
     # ─────────────────────────────────────────────────────────
 
     def get_token_attack_targets(self, top_k=5):
         """
-        获取适合做 token 级替换（标识符重命名）的攻击目标。
-        优先选择包含标识符的高重要性节点。
+        Get attack targets suitable for token-level replacement (identifier renaming).
+        Prefer high-importance nodes that contain identifiers.
 
         Returns:
             list[dict]: [{'line_no', 'code', 'importance'}, ...]
@@ -343,8 +343,8 @@ class ExplanationMapping:
 
     def get_control_flow_attack_targets(self, top_k=5):
         """
-        获取适合做控制流变换（for↔while, if-else交换等）的攻击目标。
-        筛选 CDG 边中重要性最高的边及其端点语句。
+        Get attack targets suitable for control-flow transformations (for <-> while, if-else swapping, etc.).
+        Select the highest-importance CDG edges and their endpoint statements.
 
         Returns:
             list[dict]: [{
@@ -359,15 +359,15 @@ class ExplanationMapping:
 
     def get_data_flow_attack_targets(self, top_k=5):
         """
-        获取适合做数据流变换（引入临时变量、操作数交换等）的攻击目标。
-        筛选 DDG 边中重要性最高的边及其端点语句。
+        Get attack targets suitable for data-flow transformations (introducing temporary variables, operand swapping, etc.).
+        Select the highest-importance DDG edges and their endpoint statements.
 
         Returns:
             list[dict]: [{
                 'src_line', 'src_code',
                 'dst_line', 'dst_code',
                 'importance', 'edge_label',
-                'dep_variable',   # DDG 依赖的变量名
+                'dep_variable',   # variable name depended on by the DDG edge
             }, ...]
         """
         ddg_edges = [e for e in self.vulnerable_edges if e['edge_type'] == 'DDG']
@@ -376,13 +376,13 @@ class ExplanationMapping:
 
     def get_all_attack_targets(self, top_k=5):
         """
-        获取综合攻击目标，按策略分组。
+        Get comprehensive attack targets grouped by strategy.
 
         Returns:
             dict: {
-                'token_targets':        [...],  # 适合标识符替换
-                'control_flow_targets': [...],  # 适合控制流变换
-                'data_flow_targets':    [...],  # 适合数据流变换
+                'token_targets':        [...],  # suitable for identifier replacement
+                'control_flow_targets': [...],  # suitable for control-flow transformation
+                'data_flow_targets':    [...],  # suitable for data-flow transformation
             }
         """
         return {
@@ -393,8 +393,8 @@ class ExplanationMapping:
     
     def get_all_lines_ranked(self):
         """
-        返回所有行按重要性降序排列，不做 top-k 截断。
-        供结构变换阶段使用全局排序。
+        Return all lines sorted by importance in descending order, without top-k truncation.
+        Used by the structure-transformation stage for global ranking.
         """
         return sorted(
             self.all_lines.values(),
@@ -404,8 +404,8 @@ class ExplanationMapping:
 
     def get_all_edges_ranked(self):
         """
-        返回所有边按重要性降序排列，不做 top-k 截断。
-        供结构变换阶段使用全局排序。
+        Return all edges sorted by importance in descending order, without top-k truncation.
+        Used by the structure-transformation stage for global ranking.
         """
         return sorted(
             self.all_edges,
@@ -415,12 +415,12 @@ class ExplanationMapping:
 
     def get_identifier_importance(self, source_code, lang='c'):
         """
-        基于所有节点的重要性分数，为源码中每个标识符计算优先级权重。
+        Compute a priority weight for each identifier in the source code based on all node importance scores.
 
-        策略：
-          - 每行取其所有节点中的 max(importance) 作为行分数（已在 all_lines 中完成）
-          - 每个标识符取其出现的所有行中的 max(行分数) 作为标识符权重
-          - 按权重降序排列
+        Strategy:
+          - For each line, use the max(importance) among all its nodes as the line score (already done in all_lines)
+          - For each identifier, use the maximum line score across all lines where it appears as its identifier weight
+          - Sort by weight in descending order
         """
         import re
         from common.utils.parser import extract_identifiers_from_one_src
@@ -458,19 +458,19 @@ class ExplanationMapping:
 
 
     # ─────────────────────────────────────────────────────────
-    # 展示接口
+    # Display interface
     # ─────────────────────────────────────────────────────────
 
     def print_summary(self):
-        """打印完整的映射结果摘要。"""
+        """Print a complete summary of the mapping results."""
         print("=" * 75)
         print("  Coca Explanation → Source Code Mapping")
-        print(f"  映射质量: {self.num_mapped}/{self.num_total} 节点"
+        print(f"  Mapping quality: {self.num_mapped}/{self.num_total} nodes"
               f" ({self.num_mapped/max(self.num_total,1)*100:.1f}%)")
         print("=" * 75)
 
-        # ── 关键节点 ──
-        print("\n📌 关键节点 (按重要性排序):")
+        # ── Key nodes ──
+        print("\n📌 Key nodes (sorted by importance):")
         print("-" * 75)
         for i, node in enumerate(self.vulnerable_nodes):
             bar = '█' * int(node['importance'] * 25)
@@ -482,10 +482,10 @@ class ExplanationMapping:
                   f"AST: {list(set(node['ast_types']))[:3]}")
             print()
 
-        # ── 关键边（CDG）──
+        # ── Key edges (CDG) ──
         cdg_edges = [e for e in self.vulnerable_edges if e['edge_type'] == 'CDG']
         if cdg_edges:
-            print("🔀 关键控制依赖边 (CDG):")
+            print("🔀 Key control-dependence edges (CDG):")
             print("-" * 75)
             for i, edge in enumerate(cdg_edges):
                 print(f"  #{i+1}  Line {edge['src_line']} → Line {edge['dst_line']}  "
@@ -494,10 +494,10 @@ class ExplanationMapping:
                 print(f"       Dst: {edge['dst_code'][:70]}")
                 print()
 
-        # ── 关键边（DDG）──
+        # ── Key edges (DDG) ──
         ddg_edges = [e for e in self.vulnerable_edges if e['edge_type'] == 'DDG']
         if ddg_edges:
-            print("📊 关键数据依赖边 (DDG):")
+            print("📊 Key data-dependence edges (DDG):")
             print("-" * 75)
             for i, edge in enumerate(ddg_edges):
                 dep_var = edge.get('dep_variable', '')
@@ -511,22 +511,22 @@ class ExplanationMapping:
         print("=" * 75)
 
     def print_attack_plan(self):
-        """打印按攻击策略分组的攻击计划。"""
+        """Print the attack plan grouped by attack strategy."""
         targets = self.get_all_attack_targets()
 
         print("=" * 75)
-        print("  攻击计划")
+        print("  Attack Plan")
         print("=" * 75)
 
-        print("\n🏷️  Token 级攻击（标识符重命名）:")
+        print("\n🏷️  Token-level attack (identifier renaming):")
         if targets['token_targets']:
             for t in targets['token_targets']:
                 print(f"    Line {t['line_no']}: {t['code'][:70]}  "
                       f"(imp={t['importance']:.3f})")
         else:
-            print("    无可用目标")
+            print("    No available targets")
 
-        print(f"\n🔀 控制流攻击（for↔while, if-else交换等）:")
+        print(f"\n🔀 Control-flow attack (for <-> while, if-else swapping, etc.):")
         if targets['control_flow_targets']:
             for e in targets['control_flow_targets']:
                 print(f"    Line {e['src_line']} → {e['dst_line']}  "
@@ -534,9 +534,9 @@ class ExplanationMapping:
                 print(f"      {e['src_code'][:60]}")
                 print(f"      → {e['dst_code'][:60]}")
         else:
-            print("    无 CDG 边目标")
+            print("    No CDG edge targets")
 
-        print(f"\n📊 数据流攻击（引入临时变量、操作数交换等）:")
+        print(f"\n📊 Data-flow attack (introducing temporary variables, operand swapping, etc.):")
         if targets['data_flow_targets']:
             for e in targets['data_flow_targets']:
                 dep = e.get('dep_variable', '')
@@ -545,12 +545,12 @@ class ExplanationMapping:
                 print(f"      {e['src_code'][:60]}")
                 print(f"      → {e['dst_code'][:60]}")
         else:
-            print("    无 DDG 边目标")
+            print("    No DDG edge targets")
 
         print("=" * 75)
 
     def to_dict(self):
-        """序列化为 dict（可保存为 JSON）。"""
+        """Serialize to a dict that can be saved as JSON."""
         return {
             'vulnerable_nodes': self.vulnerable_nodes,
             'vulnerable_edges': self.vulnerable_edges,
@@ -559,27 +559,27 @@ class ExplanationMapping:
         }
 
     def save(self, path):
-        """保存映射结果到 JSON 文件。"""
+        """Save mapping results to a JSON file."""
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 内部辅助函数
+# Internal helper functions
 # ══════════════════════════════════════════════════════════════════════
 
 def _make_edge_detail(src_dot_node, dst_dot_node, edge_type, edge_label,
                       dot_nodes, index2info):
-    """构造一条边的详细信息。"""
+    """Construct detailed information for one edge."""
     src_idx = dot_nodes.index(src_dot_node) if src_dot_node in dot_nodes else None
     dst_idx = dot_nodes.index(dst_dot_node) if dst_dot_node in dot_nodes else None
 
     src_info = index2info.get(src_idx, {}) if src_idx is not None else {}
     dst_info = index2info.get(dst_idx, {}) if dst_idx is not None else {}
 
-    # 从 DDG 边的 label 中提取依赖变量名
-    # 典型格式: "DDG: varName" 或 "DDG:varName"
+    # Extract the dependent variable name from the DDG edge label
+    # Typical formats: "DDG: varName" or "DDG:varName"
     dep_variable = ''
     if edge_type == 'DDG' and ':' in edge_label:
         parts = edge_label.split(':')
@@ -596,35 +596,35 @@ def _make_edge_detail(src_dot_node, dst_dot_node, edge_type, edge_label,
         'edge_type': edge_type,
         'edge_label': edge_label.strip('"'),
         'dep_variable': dep_variable,
-        'importance': 0.0,  # 后续填充
+        'importance': 0.0,  # filled later
     }
 
 
 def _load_dot_file(dot_path):
-    """使用 LooseDotParser 安全加载 dot 文件。"""
+    """Safely load a dot file with LooseDotParser."""
     if not os.path.exists(dot_path):
-        print(f"[错误] dot 文件不存在: {dot_path}")
+        print(f"[Error] dot file does not exist: {dot_path}")
         return None
 
     try:
         with open(dot_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # 使用新的解析器
+        # Use the new parser
         parser = LooseDotParser()
         pdg = parser.to_networkx(content)
         
         return pdg
 
     except Exception as e:
-        print(f"[错误] 解析 dot 文件失败: {e}")
+        print(f"[Error] Failed to parse dot file: {e}")
         return None
 
 
 def _read_source_file(source_path):
     """
-    读取 C 源码文件，返回 {行号: 代码内容} 的映射。
-    行号从 1 开始。
+    Read a C source file and return a mapping of {line number: code content}.
+    Line numbers start from 1.
     """
     source_lines = {}
     try:
@@ -632,12 +632,12 @@ def _read_source_file(source_path):
             for i, line in enumerate(f, start=1):
                 source_lines[i] = line.rstrip('\n\r')
     except Exception as e:
-        print(f"[警告] 读取源码文件失败 {source_path}: {e}")
+        print(f"[Warning] Failed to read source file {source_path}: {e}")
     return source_lines
 
 
 def _extract_code_from_dot_label(label_str):
-    """从 dot 节点 label 中提取代码片段。"""
+    """Extract a code snippet from a dot node label."""
     if not label_str:
         return ''
     label_str = label_str.strip('"')
@@ -648,7 +648,7 @@ def _extract_code_from_dot_label(label_str):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 便捷入口
+# Convenience entry point
 # ══════════════════════════════════════════════════════════════════════
 
 def explain_and_map(
@@ -663,26 +663,26 @@ def explain_and_map(
     top_k=5,
 ):
     """
-    一步到位：运行解释器 + 映射回源码。
+    Run the explainer and map the results back to source code in one step.
 
     Args:
-        explainer:       CocaExplainer 实例
-        data:            PyG Data 对象
-        predicted_label: 模型预测标签
-        dot_path:        PDG dot 文件路径
-        cpg_bin_path:    Joern cpg-bin 路径（可选）
-        cpg_json_path:   已导出的 JSON 路径（可选）
-        source_path:     原始 C 源码文件路径（可选）
-        joern_path:      Joern 安装路径
-        top_k:           返回 top-k
+        explainer:       CocaExplainer instance
+        data:            PyG Data object
+        predicted_label: model-predicted label
+        dot_path:        PDG dot file path
+        cpg_bin_path:    Joern cpg-bin path (optional)
+        cpg_json_path:   exported JSON path (optional)
+        source_path:     original C source file path (optional)
+        joern_path:      Joern installation path
+        top_k:           return top-k
 
     Returns:
-        ExplanationMapping 对象
+        ExplanationMapping object
     """
-    # 运行解释器
+    # Run the explainer
     result = explainer.explain(data, predicted_label)
 
-    # 映射回源码
+    # Map back to source code
     mapping = map_explanation_to_source(
         explain_result=result,
         dot_path=dot_path,
@@ -697,7 +697,7 @@ def explain_and_map(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 使用示例
+# Usage example
 # ══════════════════════════════════════════════════════════════════════
 def demo_mapping():
     from coca_explainer import CocaExplainer
@@ -764,26 +764,26 @@ static guint32 Short (
 }
 """
 
-    # 1. 运行解释器
+    # 1. Run the explainer
     wrapper = ModelWrapper('reveal', '{HOME_PATH}/vul_explain/23_explain_eval_ISSTA/trained_model/ori-ds/reveal/reveal-cwe119/mod_94.59_92.5_96.77_93.61.ckpt')
     pred_label,conf,margin = wrapper.predict_label_and_true_conf_margin(src2embedding(src_code,0),0)
     print(pred_label)
     print(conf)
     print(margin)
     # explainer = CocaExplainer(model=wrapper.model, device='cuda')
-    # data = read_json('{HOME_PATH}/VulDS/BigVul/ori-embedding/trans_vul/1_CVE-2013-4263_FFmpeg_CWE-119_e43a0a232dbf6d3c161823c2e07c52e76227a1bc_3_10.json')               # 一个被检测为 vulnerable 的样本
-    # pred_label = wrapper.predict_label(data)  # 通常为 1
+    # data = read_json('{HOME_PATH}/VulDS/BigVul/ori-embedding/trans_vul/1_CVE-2013-4263_FFmpeg_CWE-119_e43a0a232dbf6d3c161823c2e07c52e76227a1bc_3_10.json')               # a sample detected as vulnerable
+    # pred_label = wrapper.predict_label(data)  # usually 1
     # result = explainer.explain(data, pred_label)
 
-    # # 2. 映射回源码（完整信息）
+    # # 2. Map back to source code (full information)
     # mapping = map_explanation_to_source(
     #     explain_result=result,
     #     dot_path='{HOME_PATH}/VulDS/BigVul/ori-pdg/trans_vul/1_CVE-2013-4263_FFmpeg_CWE-119_e43a0a232dbf6d3c161823c2e07c52e76227a1bc_3_10.dot',
     #     cpg_bin_path='{HOME_PATH}/VulDS/BigVul/all-cpg-bin/trans_vul/1_CVE-2013-4263_FFmpeg_CWE-119_e43a0a232dbf6d3c161823c2e07c52e76227a1bc_3_10.bin',
-    #     source_path='{HOME_PATH}/VulDS/BigVul/all-src/trans_vul/1_CVE-2013-4263_FFmpeg_CWE-119_e43a0a232dbf6d3c161823c2e07c52e76227a1bc_3_10.c',     # 可选
+    #     source_path='{HOME_PATH}/VulDS/BigVul/all-src/trans_vul/1_CVE-2013-4263_FFmpeg_CWE-119_e43a0a232dbf6d3c161823c2e07c52e76227a1bc_3_10.c',     # optional
     # )
 
-    # 获取分策略攻击目标
+    # Get strategy-grouped attack targets
     # mapping.print_summary()
     # with open('{HOME_PATH}/VulDS/BigVul/all-src/trans_vul/1_CVE-2013-4263_FFmpeg_CWE-119_e43a0a232dbf6d3c161823c2e07c52e76227a1bc_3_10.c', 'r', encoding='utf-8', errors='ignore') as f:
     #     source_code = f.read()
