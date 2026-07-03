@@ -505,7 +505,7 @@ class ExplanationAnalyzer:
 
 def demo_explain_coca():
     # 1. Load the model (your existing workflow)
-    wrapper = ModelWrapper('reveal', '{HOME_PATH}/vul_explain/23_explain_eval_ISSTA/trained_model/ori-ds/reveal/reveal-cwe119/mod_94.59_92.5_96.77_93.61.ckpt')
+    wrapper = ModelWrapper('reveal', '{MODEL_SAVE_PATH}/trained_model/ori-ds/reveal/reveal-cwe119/mod_94.59_92.5_96.77_93.61.ckpt')
 
     # 2. Create the explainer
     explainer = CocaExplainer(

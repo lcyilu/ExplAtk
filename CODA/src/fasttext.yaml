@@ -1,0 +1,35 @@
+dataset:
+  name: "BigVul"
+  token:
+    # Vocabulary size
+    vocabulary_size: 500000
+
+# Dataset root directory
+data_folder: "{HOME_PATH}/VulDS/BigVul"
+
+# Whether to split tokens; corresponds to the split_token parameter in process_parallel.
+# FastText is recommended to use true here so it can better learn compound variable names, such as file_name -> file, name.
+split_token: true
+
+gnn:
+  embed_size: 100
+
+# Number of parallel processes during training; adjust according to your CPU core count. 4 is a safe value.
+num_workers: 4
+
+# ======================================================
+# FastText model-specific parameters; recommended to read these settings in code.
+# ======================================================
+fasttext:
+  # Minimum word frequency: code has many variable names that appear only a few times, and keeping them is important for attacks.
+  min_count: 3
+  
+  # Character-level n-gram range
+  min_n: 3
+  max_n: 6
+  
+  # Number of training epochs
+  epochs: 10
+  
+  # Context window size
+  window: 5

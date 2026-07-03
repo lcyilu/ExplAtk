@@ -82,6 +82,9 @@ class ModelWrapper:
         margin = true_conf - other_conf
         return predicted_label, true_conf, margin
     
+    def true_label(self, data):
+        return data.y
+    
     def attack_success(self, data, label):
         preds = self._forward(data)
         predicted_label = torch.argmax(preds, dim=1)

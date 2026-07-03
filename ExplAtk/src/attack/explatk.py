@@ -1215,7 +1215,7 @@ def demo_atk(source_path):
         source_path=source_path,
         source_code=source_code,
         model_name="reveal",
-        checkpoint_path="{HOME_PATH}/vul_explain/23_explain_eval_ISSTA/trained_model/ori-ds/reveal/reveal-cwe119/mod_94.59_92.5_96.77_93.61.ckpt",
+        checkpoint_path="{MODEL_SAVE_PATH}/trained_model/ori-ds/reveal/reveal-cwe119/mod_94.59_92.5_96.77_93.61.ckpt",
         true_label=1,
     )
 

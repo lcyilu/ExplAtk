@@ -765,7 +765,7 @@ static guint32 Short (
 """
 
     # 1. Run the explainer
-    wrapper = ModelWrapper('reveal', '{HOME_PATH}/vul_explain/23_explain_eval_ISSTA/trained_model/ori-ds/reveal/reveal-cwe119/mod_94.59_92.5_96.77_93.61.ckpt')
+    wrapper = ModelWrapper('reveal', '{MODEL_SAVE_PATH}/trained_model/ori-ds/reveal/reveal-cwe119/mod_94.59_92.5_96.77_93.61.ckpt')
     pred_label,conf,margin = wrapper.predict_label_and_true_conf_margin(src2embedding(src_code,0),0)
     print(pred_label)
     print(conf)
