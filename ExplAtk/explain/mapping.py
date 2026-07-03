@@ -25,7 +25,7 @@ from src.utils.dot_parser import LooseDotParser
 
 def export_nodes_from_cpg_bin(
     cpg_bin_path,
-    joern_path='{HOME_PATH}/joerns/joern-src/joern-1.1.172',
+    joern_path='{JOERN_PATH}',
     save_json_path=None,
     timeout=120,
 ):
@@ -124,7 +124,7 @@ def map_explanation_to_source(
     cpg_bin_path=None,
     cpg_json_path=None,
     source_path=None,
-    joern_path='{HOME_PATH}/joerns/joern-src/joern-1.1.172',
+    joern_path='{JOERN_PATH}',
     top_k=5,
     threshold=None,
 ) :
@@ -659,7 +659,7 @@ def explain_and_map(
     cpg_bin_path=None,
     cpg_json_path=None,
     source_path=None,
-    joern_path='{HOME_PATH}/joerns/joern-src/joern-1.1.172',
+    joern_path='{JOERN_PATH}',
     top_k=5,
 ):
     """
