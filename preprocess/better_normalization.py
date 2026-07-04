@@ -43,7 +43,7 @@ def rename_identifiers_in_code(code: bytes, language='cpp') -> str:
 
     identifiers_info = []
 
-    # 编译正则表达式，匹配identifier和所有*_identifier
+    # Compile the regular expression to match identifier and all *_identifier
     identifier_candidates = [
         'identifier',
         'field_identifier'
@@ -111,10 +111,10 @@ def rename_identifiers_in_code(code: bytes, language='cpp') -> str:
     rename_identifiers(root_node)
 
     # Replace old names with new names in the code
-    # 按位置排序，从后往前替换（避免位置偏移问题）
+    # Sort by position and replace from back to front (to avoid position offset issues)
     identifiers_info.sort(key=lambda x: (x['start_point'][0], x['start_point'][1]), reverse=True)
     
-    # 执行替换
+    # Perform the replacement
     code_lines = code.decode('utf-8').split('\n')
     
     for identifier in identifiers_info:
@@ -123,7 +123,7 @@ def rename_identifiers_in_code(code: bytes, language='cpp') -> str:
             start_row, start_col = identifier['start_point']
             end_row, end_col = identifier['end_point']
             
-            # 替换指定位置的文本
+            # Replace the text at the specified position
             if start_row < len(code_lines):
                 line = code_lines[start_row]
                 code_lines[start_row] = line[:start_col] + new_name + line[end_col:]
@@ -154,36 +154,36 @@ def remove_comments(code: str) -> str:
     """
     Remove comments from the given C/C++ code efficiently.
     """
-    # 优化后的正则：
-    # 1. (?<!:)\/\/.*     匹配 // 行注释，且前面不是 : (避免匹配 http://)
-    # 2. \/\*[\s\S]*?\*\/ 匹配 /* ... */ 块注释。[\s\S] 是匹配所有字符（含换行）的高效写法
+    # Optimized regex:
+    # 1. (?<!:)\/\/.*     Matches // line comments, and not preceded by : (to avoid matching http://)
+    # 2. \/\*[\s\S]*?\*\/ Matches /* ... */ block comments. [\s\S] is an efficient way to match any character (including newlines)
     pattern = r'(?<!:)\/\/.*|\/\*[\s\S]*?\*\/'
     
     def replacer(match):
         s = match.group(0)
-        if s.startswith('/'): # 再次确认是注释（虽然正则已保证）
-            # 如果是块注释 (/* ... */)，我们要保留其中的换行符，
-            # 这样可以保持代码的行号不变，利于后续分析。
+        if s.startswith('/'): # Double-check that it is a comment (although the regex already guarantees it)
+            # If it is a block comment (/* ... */), we keep the newline characters inside it
+            # so that the line numbers of the code remain unchanged, which helps subsequent analysis.
             if s.startswith('/*'):
                 return '\n' * s.count('\n')
-            # 如果是行注释 (// ...)，直接替换为空
+            # If it is a line comment (// ...), replace it directly with an empty string
             else:
                 return ''
         return s
 
-    # 使用 re.sub 一次性扫描并替换，效率比 findall + 循环 replace 高出几个数量级
+    # Use re.sub to scan and replace in one pass, which is orders of magnitude more efficient than findall + a replace loop
     return re.sub(pattern, replacer, code)
 
 def filter_files(file_list, valid_stems):
     """
-    根据 valid_stems (文件名列表) 过滤 file_list (完整路径列表)
+    Filter file_list (list of full paths) based on valid_stems (list of file names)
     """
-    # 1. 将白名单转为 set，查找速度从 O(n) 提升到 O(1)
+    # 1. Convert the whitelist to a set, improving lookup speed from O(n) to O(1)
     valid_set = set(valid_stems)
     
-    # 2. 列表推导式过滤
-    # os.path.basename(f): 获取文件名 "abc.json"
-    # os.path.splitext(...)[0]: 获取 "abc" (stem)
+    # 2. Filter using a list comprehension
+    # os.path.basename(f): get the file name "abc.json"
+    # os.path.splitext(...)[0]: get "abc" (stem)
     filtered_list = [
         f for f in file_list 
         if os.path.splitext(os.path.basename(f))[0] in valid_set
@@ -208,14 +208,14 @@ def normalize(dirpath, ds_list_path, output_dir=None, language='cpp'):
         for dl in ds_list_path:
             with open(dl, 'r') as f:
                 data = json.load(f)
-            # 遍历当前文件的每一个 key
+            # Iterate over every key of the current file
             for key, value_list in data.items():
-                # 确保 value_list 是列表，防止数据格式错误导致报错
+                # Make sure value_list is a list, to prevent errors caused by malformed data
                 if isinstance(value_list, list):
-                    # update 方法会将列表中的元素逐个加入集合，并自动去重
+                    # The update method adds each element of the list into the set and deduplicates automatically
                     merged_data[key].update(value_list)
                 else:
-                    # 如果不是列表（例如只是单个字符串），这行代码兼容处理
+                    # If it is not a list (e.g. just a single string), this line handles it for compatibility
                     merged_data[key].add(value_list)
         
         for key, value_set in merged_data.items():

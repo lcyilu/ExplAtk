@@ -9,7 +9,7 @@ COUNTRESULTPATH="../CountResult/"
 
 function getAvailableActions() {
     local ACTIONS_FILE=$COUNTRESULTPATH"trans_actions.txt"
-    # 读取每一行非空且为数字的变换编号
+    # Read each non-empty line that contains a numeric transformation ID
     grep -E '^[0-9]+$' $ACTIONS_FILE | sort -n | uniq
 }
 
@@ -19,7 +19,7 @@ function getAvailableActions() {
     ACTION=$2 
     # cd $PROJECTPATH  
 
-    # 进行指定类型变换
+    # Perform the specified type of transformation
     txl   -q -s 128  $TRANSFORMCODE $TXLCODEPATH"RemoveCompoundStateSemicolon.Txl" > temp0.c  &&
     txl   -q -s 128 temp0.c $TXLCODEPATH"RemoveNullStatements.Txl" > temp00.c &&
     case ${ACTION} in 
@@ -83,14 +83,14 @@ function getAvailableActions() {
     
 }
 
-# 批量处理函数
+# Batch processing function
 function batchProcess(){
     filelist=$1
     out_dir=$2
     while IFS= read -r code_path; do
-        # 跳过空行
+        # Skip empty lines
         [[ -z "$code_path" ]] && continue
-        # 调用原有 main 逻辑
+        # Call the existing main logic
         main "$code_path" "$out_dir"
     done < "$filelist"
 }
@@ -114,18 +114,13 @@ function main(){
     done    
 }
 
-# 如果参数为2个，单文件处理；如果为3个，批量处理
+# If there are 2 arguments, process a single file; if there are 3 arguments, process files in batch mode
 if [[ $# -eq 2 ]]; then
     main "$1" "$2"
 elif [[ $# -eq 3 ]]; then
     batchProcess "$1" "$2"
 else
-    echo "用法: $0 <源文件路径> <输出目录> 或 $0 <文件列表txt> <输出目录> <batch>"
+    echo "Usage: $0 <source_file_path> <output_directory> or $0 <file_list_txt> <output_directory> <batch>"
     exit 1
 fi
- 
-
-
-
- 
  

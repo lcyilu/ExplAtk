@@ -40,7 +40,7 @@ def joern_parse(file, outdir):
     if os.path.exists(out):
         return
     os.environ['file'] = str(file)
-    os.environ['out'] = str(out) #parse后的文件名与source文件名称一致
+    os.environ['out'] = str(out) # The parsed file name is the same as the source file name
     os.system('sh joern-parse $file --language c --out $out')
     with open(record_txt, 'a+') as f:
         f.writelines(name+'\n')
@@ -62,7 +62,7 @@ def joern_export(bin, outdir, repr):
     os.environ['out'] = str(out)
     
     if repr == 'pdg':
-        os.system('sh joern-export $bin'+ " --repr " + "pdg" + ' --out $out') # cpg 改成 pdg
+        os.system('sh joern-export $bin'+ " --repr " + "pdg" + ' --out $out') # Change cpg to pdg
         try:
             pdg_list = os.listdir(out)
             for pdg in pdg_list:

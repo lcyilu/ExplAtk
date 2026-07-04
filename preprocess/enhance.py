@@ -17,7 +17,7 @@ def trans_vul_filter(ds_name):
             file_path = file_path.strip()
             if file_path in vul_files:
                 vul_files.remove(file_path)
-    print(f"过滤掉语法错误的样本后，剩余{len(vul_files)}个样本")
+    print(f"After filtering out samples with syntax errors, {len(vul_files)} samples remain")
     with open(os.path.join(src_dir, 'vul_filtered.txt'), 'w') as f:
         for file_path in vul_files:
             f.write(file_path + '\n')
@@ -36,7 +36,7 @@ def trans_novul_filter(ds_name):
             file_path = file_path.strip()
             if file_path in novul_files:
                 novul_files.remove(file_path)
-    print(f"过滤掉语法错误的样本后，剩余{len(novul_files)}个样本")
+    print(f"After filtering out samples with syntax errors, {len(novul_files)} samples remain")
     with open(os.path.join(src_dir, 'novul_filtered.txt'), 'w') as f:
         for file_path in novul_files:
             f.write(file_path + '\n')
@@ -84,10 +84,10 @@ def enhance_novul_data(ds_name):
 
 def main():
     # for ds_name in DS_LIST:
-    #     # 对应数据集执行完语法检测 "./batch_txl.sh {vul_dir} {txl_opt}"
-    #     # 生成语法错误样本列表后 CODE_TRANS_TXL_SH + "failed_files_{ds_name}.txt"
+    #     # Run syntax checking for the corresponding dataset: "./batch_txl.sh {vul_dir} {txl_opt}"
+    #     # After generating the list of syntax-error samples: CODE_TRANS_TXL_SH + "failed_files_{ds_name}.txt"
     #     trans_vul_filter(ds_name)
-    #     # 生成增强样本
+    #     # Generate augmented samples
     #     enhance_data(ds_name)
 
     trans_novul_filter('Devign')
